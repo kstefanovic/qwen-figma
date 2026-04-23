@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+transformers
+torch
+pillow
+accelerate
+sentencepiece
+einops
+requests
+pydantic
