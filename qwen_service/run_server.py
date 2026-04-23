@@ -11,6 +11,7 @@ HOST = os.environ.get("QWEN_HOST", "127.0.0.1")
 PORT = int(os.environ.get("QWEN_PORT", "10196"))
 MAX_NEW_TOKENS = int(os.environ.get("QWEN_MAX_NEW_TOKENS", "2048"))
 TEMPERATURE = float(os.environ.get("QWEN_TEMPERATURE", "0.1"))
+MAX_IMAGE_LONG_SIDE = int(os.environ.get("QWEN_MAX_IMAGE_LONG_SIDE", "1600"))
 
 
 app = create_app(
@@ -18,6 +19,7 @@ app = create_app(
     device=DEVICE,
     max_new_tokens=MAX_NEW_TOKENS,
     temperature=TEMPERATURE,
+    max_image_long_side=MAX_IMAGE_LONG_SIDE,
 )
 
 

@@ -9,6 +9,35 @@ from banner_pipeline.build_candidates import CandidateBundle, SemanticCandidate
 from banner_pipeline.heuristics import HeuristicAnnotatedCandidate, HeuristicBundle
 
 
+def _extract_http_error_detail(resp: requests.Response) -> str:
+    try:
+        payload = resp.json()
+    except Exception:
+        text = (resp.text or "").strip()
+        return text[:8000] if text else "(empty response body)"
+
+    detail = payload.get("detail")
+    if detail is None:
+        return str(payload)[:8000]
+    if isinstance(detail, list):
+        parts: list[str] = []
+        for item in detail:
+            if isinstance(item, dict):
+                loc = item.get("loc")
+                msg = item.get("msg")
+                parts.append(f"{loc}: {msg}" if loc or msg else str(item))
+            else:
+                parts.append(str(item))
+        joined = "; ".join(parts)
+        return joined[:8000]
+    return str(detail)[:8000]
+
+
+def _format_qwen_service_http_error(endpoint: str, resp: requests.Response) -> str:
+    detail = _extract_http_error_detail(resp)
+    return f"Qwen service request failed: {endpoint} status={resp.status_code} detail={detail}"
+
+
 @dataclass
 class BannerAnnotation:
     layout_pattern: str = "unknown"
@@ -110,7 +139,8 @@ class QwenAnnotator:
             f"{self.base_url}/health",
             timeout=self.timeout_seconds,
         )
-        resp.raise_for_status()
+        if not resp.ok:
+            raise RuntimeError(_format_qwen_service_http_error("/health", resp))
         return resp.json()
 
     def annotate_banner(
@@ -200,11 +230,16 @@ class QwenAnnotator:
 
         for candidate in candidate_bundle.all_candidates:
             heuristic_ann = heuristic_map.get(candidate.candidate_id)
-            out[candidate.candidate_id] = self.annotate_candidate(
-                banner_image_path=banner_image_path,
-                candidate=candidate,
-                heuristic_annotation=heuristic_ann,
-            )
+            try:
+                out[candidate.candidate_id] = self.annotate_candidate(
+                    banner_image_path=banner_image_path,
+                    candidate=candidate,
+                    heuristic_annotation=heuristic_ann,
+                )
+            except Exception as e:
+                raise RuntimeError(
+                    f"Candidate annotation failed for candidate_id={candidate.candidate_id!r}: {e}"
+                ) from e
         return out
 
     def annotate_group_candidates(
@@ -231,11 +266,16 @@ class QwenAnnotator:
             seen.add(candidate.candidate_id)
 
             heuristic_ann = heuristic_map.get(candidate.candidate_id)
-            out[candidate.candidate_id] = self.annotate_group_candidate(
-                banner_image_path=banner_image_path,
-                candidate=candidate,
-                heuristic_annotation=heuristic_ann,
-            )
+            try:
+                out[candidate.candidate_id] = self.annotate_group_candidate(
+                    banner_image_path=banner_image_path,
+                    candidate=candidate,
+                    heuristic_annotation=heuristic_ann,
+                )
+            except Exception as e:
+                raise RuntimeError(
+                    f"Group candidate annotation failed for candidate_id={candidate.candidate_id!r}: {e}"
+                ) from e
         return out
 
     def _post(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -244,5 +284,6 @@ class QwenAnnotator:
             json=payload,
             timeout=self.timeout_seconds,
         )
-        resp.raise_for_status()
+        if not resp.ok:
+            raise RuntimeError(_format_qwen_service_http_error(endpoint, resp))
         return resp.json()
