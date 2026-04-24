@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import io
 import json
 import logging
 import math
@@ -29,6 +31,8 @@ from qwen_service.schemas import (
     CandidateAnnotateRequest,
     GroupAnnotateRequest,
     HealthResponse,
+    SceneAnnotateRequest,
+    SemanticStructureAnnotateRequest,
 )
 
 try:
@@ -162,6 +166,10 @@ def _normalize_category_code(value: str) -> str:
     if not s:
         return "unknown"
     return s
+
+
+def _prompt_json(data: Any) -> str:
+    return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
 
 def _compact_candidate_bundle_for_brand_context(candidate_bundle: Optional[dict[str, Any]]) -> dict[str, Any]:
@@ -566,10 +574,10 @@ class QwenRuntime:
         self,
         model_path: str,
         device: str = "cuda:1",
-        max_new_tokens: int = 512,
-        temperature: float = 0.1,
+        max_new_tokens: int = 768,
+        temperature: float = 0.0,
         use_fp16: bool = True,
-        max_image_long_side: int = 1600,
+        max_image_long_side: int = 1024,
     ) -> None:
         self.model_path = model_path
         self.device = device
@@ -597,6 +605,11 @@ class QwenRuntime:
             trust_remote_code=True,
         ).to(self.device)
         self.model.eval()
+        if self.temperature <= 0 and hasattr(self.model, "generation_config"):
+            self.model.generation_config.do_sample = False
+            for attr in ("temperature", "top_p", "top_k"):
+                if hasattr(self.model.generation_config, attr):
+                    setattr(self.model.generation_config, attr, None)
 
     def ensure_loaded(self) -> None:
         if self.model is None or self.processor is None:
@@ -609,9 +622,14 @@ class QwenRuntime:
         return Image.open(path).convert("RGB")
 
     def _prepare_image_for_model(self, image: Image.Image, label: str) -> Image.Image:
-        """Validate, RGB, min-side guard, then cap long side — safe for Qwen image processor."""
+        """Validate, RGB, cap long side to 1024, then JPEG-recompress for smaller VLM payloads."""
         img = _ensure_valid_image_for_qwen(image, label)
-        return _resize_image_for_qwen(img, self.max_image_long_side)
+        max_long_side = min(int(self.max_image_long_side), 1024)
+        img = _resize_image_for_qwen(img, max_long_side)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=82, optimize=True)
+        buf.seek(0)
+        return Image.open(buf).convert("RGB")
 
     def _crop_candidate(self, image: Image.Image, candidate: dict[str, Any], expand_ratio: float = 0.0) -> Image.Image:
         width, height = image.size
@@ -644,7 +662,7 @@ class QwenRuntime:
             )
         return cropped
 
-    def _run_model(self, images: list[Image.Image], prompt: str) -> str:
+    def _run_model(self, images: list[Image.Image], prompt: str, *, max_new_tokens: Optional[int] = None) -> str:
         self.ensure_loaded()
         for i, img in enumerate(images):
             if img is None:
@@ -656,41 +674,72 @@ class QwenRuntime:
                 raise ValueError(
                     f"_run_model: images[{i}] min side {min(w, h)} < {_QWEN_MIN_PIXEL_SIDE} (should have been prepared)"
                 )
+        mtokens = int(max_new_tokens) if max_new_tokens is not None else int(self.max_new_tokens)
         content = [{"type": "image", "image": img} for img in images]
         content.append({"type": "text", "text": prompt})
         messages = [{"role": "user", "content": content}]
         text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = self.processor(text=[text], images=images, padding=True, return_tensors="pt")
         inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+        generate_kwargs: dict[str, Any] = {
+            "max_new_tokens": mtokens,
+            "do_sample": self.temperature > 0,
+        }
+        if self.temperature > 0:
+            generate_kwargs["temperature"] = self.temperature
         with torch.no_grad():
-            generated_ids = self.model.generate(**inputs, max_new_tokens=self.max_new_tokens, do_sample=self.temperature > 0, temperature=self.temperature)
+            generated_ids = self.model.generate(
+                **inputs,
+                **generate_kwargs,
+            )
         output_text = self.processor.batch_decode(generated_ids[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         return output_text.strip()
 
     def _extract_json(self, text: str) -> Any:
         text = text.strip()
-        try:
-            return json.loads(text)
-        except Exception:
-            pass
+        parsed = self._json_load_relaxed(text)
+        if parsed is not None:
+            return parsed
         fenced = re.findall(r"```(?:json)?\s*(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
         for block in fenced:
-            try:
-                return json.loads(block.strip())
-            except Exception:
-                continue
+            parsed = self._json_load_relaxed(block.strip())
+            if parsed is not None:
+                return parsed
         obj_match = self._find_balanced_json_substring(text, "{", "}")
         if obj_match is not None:
-            try:
-                return json.loads(obj_match)
-            except Exception:
-                pass
+            parsed = self._json_load_relaxed(obj_match)
+            if parsed is not None:
+                return parsed
         arr_match = self._find_balanced_json_substring(text, "[", "]")
         if arr_match is not None:
-            try:
-                return json.loads(arr_match)
-            except Exception:
-                pass
+            parsed = self._json_load_relaxed(arr_match)
+            if parsed is not None:
+                return parsed
+        return None
+
+    def _json_load_relaxed(self, text: str) -> Any:
+        candidate = (text or "").strip()
+        if not candidate:
+            return None
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
+
+        repaired = candidate.replace("\u201c", '"').replace("\u201d", '"').replace("\u2018", "'").replace("\u2019", "'")
+        repaired = re.sub(r",(\s*[}\]])", r"\1", repaired)
+        repaired = repaired.replace("\x00", "")
+        try:
+            return json.loads(repaired)
+        except Exception:
+            pass
+
+        try:
+            value = ast.literal_eval(repaired)
+            if isinstance(value, (dict, list)):
+                return value
+        except Exception:
+            pass
         return None
 
     def _find_balanced_json_substring(self, text: str, open_char: str, close_char: str) -> Optional[str]:
@@ -1155,13 +1204,612 @@ Return JSON only:
             raw_model_output=raw_output,
         )
 
+    def _build_semantic_structure_prompt(self, figma_summary: dict[str, Any]) -> str:
+        elem_ids = figma_summary.get("element_annotation_candidate_ids") or []
+        grp_ids = figma_summary.get("group_annotation_candidate_ids") or []
+        summary_json = json.dumps(figma_summary, ensure_ascii=False, indent=2)
+        return f"""
+You are a senior layout + semantics analyst for retail / marketplace ad banners.
+
+You receive:
+1) The full banner image.
+2) A compact JSON summary built from structured Figma export data (hierarchy, ids, names, types, text,
+   geometry, parent/child ids, plus semantic CANDIDATES and heuristic hints).
+
+Rules (critical):
+- Treat the Figma summary as the source of truth for structure. Do NOT invent node ids or candidate_ids.
+- Only emit keys in "element_annotations" for candidate_ids listed in element_annotation_candidate_ids.
+- Only emit keys in "group_annotations" for candidate_ids listed in group_annotation_candidate_ids.
+- If uncertain about a candidate, keep the heuristic_role as element_role or use "unknown".
+- Prefer fewer, high-confidence annotations; do not label every decoration as functional.
+- Do not over-label large background shapes as headline/CTA.
+
+Allowed element_role values:
+headline, subheadline, body_text, legal, price_main, price_old, price_fraction,
+discount_text, cta, label, badge_text, logo_text,
+product_image, hero_photo, logo_icon, brand_mark, background_shape,
+background_panel, decoration, discount_badge, age_badge, packshot,
+text_container, image_container, promo_container, unknown
+
+Allowed functional_type: functional, decorative, background
+Allowed importance_level: critical, high, medium, low
+
+Allowed group_role values:
+brand_group, headline_group, price_group, cta_group, product_group,
+legal_group, badge_group, decoration_group, text_group, hero_group,
+background_group, unknown
+
+Allowed internal_layout: vertical_stack, horizontal_row, overlay, freeform, single
+
+Allowed layout_pattern values:
+left_text_right_image,
+left_text_right_product,
+price_left_product_right,
+centered_text_decorative_background,
+full_background_text_overlay,
+top_image_bottom_text_mobile,
+top_text_bottom_product_mobile,
+product_dominant_mobile,
+promo_text_only,
+catalog_price_card,
+unknown
+
+Figma summary JSON:
+{summary_json}
+
+element_annotation_candidate_ids (must only use these keys in element_annotations):
+{json.dumps(elem_ids, ensure_ascii=False)}
+
+group_annotation_candidate_ids (must only use these keys in group_annotations):
+{json.dumps(grp_ids, ensure_ascii=False)}
+
+Return JSON only (no markdown fences):
+{{
+  "brand_family": "snake_case_or_generic",
+  "brand_confidence": 0.0,
+  "language": "ru|en|kk|mixed|unknown",
+  "category": "snake_case_category_or_unknown",
+  "layout_pattern": "...",
+  "pattern_confidence": 0.0,
+  "zones": [
+    {{
+      "zone_role": "text_zone|image_zone|product_zone|legal_zone|promo_zone|background_zone|overlay_zone|brand_zone",
+      "description": "short",
+      "approx_position": "top|bottom|left|right|center|full",
+      "importance_level": "critical|high|medium|low"
+    }}
+  ],
+  "element_annotations": {{
+    "CANDIDATE_ID": {{
+      "element_role": "...",
+      "semantic_name": "",
+      "parent_semantic_name": "",
+      "functional_type": "functional|decorative|background",
+      "importance_level": "critical|high|medium|low",
+      "is_text": true,
+      "is_brand_related": false,
+      "is_required_for_compliance": false,
+      "adaptation_policy": {{
+        "preserve_as_unit": true,
+        "allow_reflow": false,
+        "allow_scale": true,
+        "allow_crop": false,
+        "allow_shift": true,
+        "drop_priority": 0,
+        "anchor_type": "free"
+      }},
+      "confidence": 0.0,
+      "reason_short": "one short sentence"
+    }}
+  }},
+  "group_annotations": {{
+    "CANDIDATE_ID": {{
+      "group_role": "...",
+      "semantic_name": "",
+      "parent_semantic_name": "",
+      "internal_layout": "vertical_stack|horizontal_row|overlay|freeform|single",
+      "preserve_as_unit": true,
+      "importance_level": "medium",
+      "adaptation_policy": {{
+        "allow_reflow": true,
+        "allow_scale": true,
+        "allow_crop": false,
+        "allow_shift": true,
+        "drop_priority": 0,
+        "anchor_type": "free"
+      }},
+      "confidence": 0.0,
+      "reason_short": "one short sentence"
+    }}
+  }},
+  "updates": [
+    {{
+      "source_figma_id": "...",
+      "path": "...",
+      "role": "...",
+      "semantic_name": "...",
+      "parent_semantic_name": "",
+      "confidence": 0.0,
+      "reason": ""
+    }}
+  ],
+  "groups": [
+    {{
+      "id": "...",
+      "role": "...",
+      "semantic_name": "...",
+      "children": ["..."],
+      "confidence": 0.0,
+      "reason": ""
+    }}
+  ],
+  "preservation_priorities": [
+    {{"role": "logo", "priority": 1}}
+  ],
+  "reason_short": "overall note"
+}}
+""".strip()
+
+    def _semantic_structure_heuristic_fallback(self, figma_summary: dict[str, Any]) -> dict[str, Any]:
+        """No VLM / parse recovery: reuse pipeline heuristics via existing fallback builders."""
+        elem_ann: dict[str, Any] = {}
+        grp_ann: dict[str, Any] = {}
+        cands = figma_summary.get("candidates") or []
+        cid_to_row: dict[str, dict[str, Any]] = {}
+        for row in cands:
+            if isinstance(row, dict) and row.get("candidate_id"):
+                cid_to_row[str(row["candidate_id"])] = row
+
+        for cid in figma_summary.get("element_annotation_candidate_ids") or []:
+            cid_s = str(cid)
+            row = cid_to_row.get(cid_s, {})
+            cand_dict: dict[str, Any] = {
+                "candidate_id": cid_s,
+                "candidate_type": str(row.get("candidate_type") or "unknown"),
+                "role_hint": row.get("heuristic_role"),
+                "bbox_canvas": row.get("bbox_canvas") or [0.0, 0.0, 0.1, 0.1],
+            }
+            ha: dict[str, Any] | None = None
+            if row.get("heuristic_role") is not None or row.get("importance") is not None:
+                ha = {
+                    "final_role_hint": row.get("heuristic_role"),
+                    "final_importance_hint": row.get("importance"),
+                }
+            ca = _fallback_candidate_annotation(
+                cid_s,
+                cand_dict,
+                ha,
+                "Heuristic fallback (single-pass semantic_structure).",
+            )
+            elem_ann[cid_s] = {
+                "element_role": ca.element_role,
+                "functional_type": ca.functional_type,
+                "importance_level": ca.importance_level,
+                "is_text": ca.is_text,
+                "is_brand_related": ca.is_brand_related,
+                "is_required_for_compliance": ca.is_required_for_compliance,
+                "adaptation_policy": ca.adaptation_policy,
+                "confidence": ca.confidence,
+                "reason_short": ca.reason_short,
+            }
+
+        for cid in figma_summary.get("group_annotation_candidate_ids") or []:
+            cid_s = str(cid)
+            row = cid_to_row.get(cid_s, {})
+            cand_dict = {
+                "candidate_id": cid_s,
+                "candidate_type": str(row.get("candidate_type") or "unknown"),
+                "role_hint": row.get("heuristic_role"),
+                "bbox_canvas": row.get("bbox_canvas") or [0.0, 0.0, 0.1, 0.1],
+            }
+            ha = None
+            if row.get("heuristic_group") is not None or row.get("importance") is not None:
+                ha = {
+                    "final_group_hint": row.get("heuristic_group"),
+                    "final_importance_hint": row.get("importance"),
+                }
+            ga = _fallback_group_annotation(
+                cid_s,
+                cand_dict,
+                ha,
+                "Heuristic fallback (single-pass semantic_structure).",
+            )
+            grp_ann[cid_s] = {
+                "group_role": ga.group_role,
+                "internal_layout": ga.internal_layout,
+                "preserve_as_unit": ga.preserve_as_unit,
+                "importance_level": ga.importance_level,
+                "adaptation_policy": ga.adaptation_policy,
+                "confidence": ga.confidence,
+                "reason_short": ga.reason_short,
+            }
+
+        return {
+            "brand_family": "generic",
+            "brand_confidence": 0.25,
+            "language": "unknown",
+            "category": "unknown",
+            "layout_pattern": "unknown",
+            "pattern_confidence": 0.0,
+            "zones": [],
+            "element_annotations": elem_ann,
+            "group_annotations": grp_ann,
+            "updates": [],
+            "groups": [],
+            "preservation_priorities": [],
+            "reason_short": "Heuristic fallback without VLM output.",
+            "raw_model_output": "",
+        }
+
+    def _finalize_semantic_structure_response(
+        self,
+        data: dict[str, Any],
+        figma_summary: dict[str, Any],
+        raw_output: str,
+    ) -> dict[str, Any]:
+        elem_allowed = set(str(x) for x in (figma_summary.get("element_annotation_candidate_ids") or []))
+        grp_allowed = set(str(x) for x in (figma_summary.get("group_annotation_candidate_ids") or []))
+
+        elem_in = data.get("element_annotations") if isinstance(data.get("element_annotations"), dict) else {}
+        elem_out: dict[str, Any] = {}
+        for k, v in elem_in.items():
+            ks = str(k)
+            if ks not in elem_allowed or not isinstance(v, dict):
+                continue
+            elem_out[ks] = {
+                "element_role": str(v.get("element_role", "unknown")).lower().strip() or "unknown",
+                "semantic_name": str(v.get("semantic_name", "") or "").strip(),
+                "parent_semantic_name": str(v.get("parent_semantic_name", "") or "").strip(),
+                "functional_type": str(v.get("functional_type", "functional")).lower().strip() or "functional",
+                "importance_level": _normalize_importance_level(str(v.get("importance_level", ""))),
+                "is_text": v.get("is_text", None),
+                "is_brand_related": bool(v.get("is_brand_related", False)),
+                "is_required_for_compliance": bool(v.get("is_required_for_compliance", False)),
+                "adaptation_policy": dict(v.get("adaptation_policy") or {}) or _default_candidate_adaptation_policy(),
+                "confidence": float(v.get("confidence", 0.0) or 0.0),
+                "reason_short": str(v.get("reason_short", "")),
+            }
+
+        grp_in = data.get("group_annotations") if isinstance(data.get("group_annotations"), dict) else {}
+        grp_out: dict[str, Any] = {}
+        for k, v in grp_in.items():
+            ks = str(k)
+            if ks not in grp_allowed or not isinstance(v, dict):
+                continue
+            grp_out[ks] = {
+                "group_role": str(v.get("group_role", "unknown")).lower().strip() or "unknown",
+                "semantic_name": str(v.get("semantic_name", "") or "").strip(),
+                "parent_semantic_name": str(v.get("parent_semantic_name", "") or "").strip(),
+                "internal_layout": str(v.get("internal_layout", "freeform")).lower().strip() or "freeform",
+                "preserve_as_unit": bool(v.get("preserve_as_unit", True)),
+                "importance_level": _normalize_importance_level(str(v.get("importance_level", ""))),
+                "adaptation_policy": dict(v.get("adaptation_policy") or {}) or _default_group_adaptation_policy(),
+                "confidence": float(v.get("confidence", 0.0) or 0.0),
+                "reason_short": str(v.get("reason_short", "")),
+            }
+
+        brand_slice = {
+            "brand_family": data.get("brand_family", "generic"),
+            "brand_confidence": float(data.get("brand_confidence", data.get("pattern_confidence", 0.0)) or 0.0),
+            "language": data.get("language", "unknown"),
+            "category": data.get("category", "unknown"),
+            "reason_short": str(data.get("reason_short", "") or "single-pass semantic_structure"),
+        }
+        bc = _finalize_brand_context_output(brand_slice, raw_output)
+
+        return {
+            "brand_family": bc.brand_family,
+            "brand_confidence": bc.brand_confidence,
+            "language": bc.language,
+            "category": bc.category,
+            "layout_pattern": str(data.get("layout_pattern", "unknown")),
+            "pattern_confidence": float(data.get("pattern_confidence", 0.0) or 0.0),
+            "zones": list(data.get("zones", []) or []),
+            "element_annotations": elem_out,
+            "group_annotations": grp_out,
+            "updates": list(data.get("updates", []) or []),
+            "groups": list(data.get("groups", []) or []),
+            "preservation_priorities": list(data.get("preservation_priorities", []) or []),
+            "reason_short": str(data.get("reason_short", "") or bc.reason_short),
+            "raw_model_output": raw_output,
+        }
+
+    def _build_scene_prompt(self, request: SceneAnnotateRequest) -> str:
+        figma_summary = request.figma_summary or {}
+        node_refs = [
+            {
+                "id": node.get("id"),
+                "path": node.get("path"),
+                "name": node.get("name"),
+                "name_is_generic": node.get("name_is_generic"),
+                "type": node.get("type"),
+                "text": node.get("text"),
+                "bbox_canvas": node.get("bbox_canvas"),
+                "parent_id": node.get("parent_id"),
+                "children_ids": node.get("children_ids"),
+                "visual_hints": node.get("visual_hints"),
+            }
+            for node in (figma_summary.get("nodes") or [])[:120]
+            if isinstance(node, dict)
+        ]
+        candidate_refs = [
+            {
+                "candidate_id": cand.get("candidate_id"),
+                "candidate_type": cand.get("candidate_type"),
+                "source_node_ids": cand.get("source_node_ids"),
+                "bbox_canvas": cand.get("bbox_canvas"),
+                "text_content": cand.get("text_content"),
+                "heuristic_role": cand.get("heuristic_role"),
+                "heuristic_group": cand.get("heuristic_group"),
+                "importance": cand.get("importance"),
+                "grouping_reason": cand.get("grouping_reason"),
+                "member_count": cand.get("member_count"),
+            }
+            for cand in (figma_summary.get("candidates") or [])[:80]
+            if isinstance(cand, dict)
+        ]
+        return f"""
+You are a scene-level semantic correction engine for a Figma banner adaptation backend.
+
+Critical rules:
+- Analyze ONLY the current design. Do not copy names from previous examples.
+- Use the Figma-derived node tree and ids as source of truth.
+- Do NOT invent candidate ids, figma ids, paths, or child ids.
+- Return ONE valid JSON object only. No markdown, no prose, no comments.
+- The response must start with `{{` and end with `}}`.
+- If unsure, keep heuristic semantics or return empty strings/empty arrays.
+- Classify 0+, 3+, 6+, 12+, 16+, 18+ as age_badge, never as price_group.
+- Only use price_group when text clearly contains real pricing markers like ₽, $, €, руб, %, скид, от, numeric price formats.
+- If multiple nearby stars/sparkles belong to one decorative family, use one decoration_group.
+- Brand/logo naming must adapt to the current design: if the mark is not M-shaped, do not call it logo_m. Use logo_heart, logo_leaf, or logo_mark when appropriate.
+- For fragmented brand text like Я + ндекс or Ya + ndex, name parts adaptively using brand_name_yandex_part, brand_name_market_part, brand_name_lavka_part when needed.
+- Prefer short semantic names suitable for Figma layer names.
+
+Allowed element semantic_name examples:
+headline, subheadline, legal_text, age_badge, price_group,
+brand_group, logo, logo_mark, logo_m, logo_heart, logo_leaf, logo_ellipse,
+brand_name_yandex, brand_name_market, brand_name_lavka,
+brand_name_yandex_part, brand_name_market_part, brand_name_lavka_part,
+decoration_group, decoration_star, decoration_sparkle, decoration_glow,
+hero_group, hero_item, hero_person, product_item, product_food, product_drink,
+background_group, background_color, background_shape, background_gradient, visual_asset
+
+Allowed group semantic_name examples:
+brand_group, headline_group, legal_group, badge_group, decoration_group, hero_group, background_group
+
+Compact banner metadata JSON:
+{_prompt_json(request.banner_metadata)}
+
+Compact node refs JSON:
+{_prompt_json(node_refs)}
+
+Compact candidate refs JSON:
+{_prompt_json(candidate_refs)}
+
+Compact heuristic roles JSON:
+{_prompt_json(request.heuristic_roles)}
+
+Allowed element candidate ids:
+{_prompt_json(figma_summary.get("element_annotation_candidate_ids") or [])}
+
+Allowed group candidate ids:
+{_prompt_json(figma_summary.get("group_annotation_candidate_ids") or [])}
+
+Return this JSON shape only:
+{{
+  "brand_family": "generic",
+  "brand_confidence": 0.0,
+  "language": "unknown",
+  "category": "unknown",
+  "layout_pattern": "unknown",
+  "pattern_confidence": 0.0,
+  "zones": [],
+  "element_annotations": {{
+    "candidate_id": {{
+      "element_role": "unknown",
+      "semantic_name": "",
+      "parent_semantic_name": "",
+      "functional_type": "functional",
+      "importance_level": "medium",
+      "is_text": null,
+      "is_brand_related": false,
+      "is_required_for_compliance": false,
+      "adaptation_policy": {{
+        "preserve_as_unit": true,
+        "allow_reflow": false,
+        "allow_scale": true,
+        "allow_crop": false,
+        "allow_shift": true,
+        "drop_priority": 0,
+        "anchor_type": "free"
+      }},
+      "confidence": 0.0,
+      "reason_short": ""
+    }}
+  }},
+  "group_annotations": {{
+    "candidate_id": {{
+      "group_role": "unknown",
+      "semantic_name": "",
+      "parent_semantic_name": "",
+      "internal_layout": "freeform",
+      "preserve_as_unit": true,
+      "importance_level": "medium",
+      "adaptation_policy": {{
+        "allow_reflow": true,
+        "allow_scale": true,
+        "allow_crop": false,
+        "allow_shift": true,
+        "drop_priority": 0,
+        "anchor_type": "free"
+      }},
+      "confidence": 0.0,
+      "reason_short": ""
+    }}
+  }},
+  "updates": [
+    {{
+      "source_figma_id": "...",
+      "path": "...",
+      "role": "...",
+      "semantic_name": "...",
+      "parent_semantic_name": "",
+      "confidence": 0.0,
+      "reason": ""
+    }}
+  ],
+  "groups": [
+    {{
+      "id": "...",
+      "role": "...",
+      "semantic_name": "...",
+      "parent_semantic_name": "",
+      "children": ["..."],
+      "confidence": 0.0,
+      "reason": ""
+    }}
+  ],
+  "semantic_relations": [],
+  "layout_constraints": [],
+  "preservation_priorities": [],
+  "reason_short": ""
+}}
+""".strip()
+
+    def _scene_heuristic_fallback(self, request: SceneAnnotateRequest) -> dict[str, Any]:
+        figma_summary = request.figma_summary or {}
+        out = self._semantic_structure_heuristic_fallback(figma_summary)
+        out["semantic_relations"] = []
+        out["layout_constraints"] = []
+        return out
+
+    def _finalize_scene_response(
+        self,
+        parsed: dict[str, Any],
+        request: SceneAnnotateRequest,
+        raw_output: str,
+    ) -> dict[str, Any]:
+        out = self._finalize_semantic_structure_response(parsed, request.figma_summary or {}, raw_output)
+        figma_summary = request.figma_summary or {}
+        node_by_id = {}
+        node_by_path = {}
+        for node in figma_summary.get("nodes") or []:
+            if not isinstance(node, dict):
+                continue
+            node_id = str(node.get("id", "") or "")
+            path = str(node.get("path", "") or "")
+            if node_id:
+                node_by_id[node_id] = node
+            node_by_path[path] = node
+
+        allowed_children = set(node_by_id.keys())
+        normalized_updates: list[dict[str, Any]] = []
+        for item in parsed.get("updates") or []:
+            if not isinstance(item, dict):
+                continue
+            source_figma_id = str(item.get("source_figma_id", "") or "")
+            path = str(item.get("path", "") or "")
+            if not source_figma_id or source_figma_id not in allowed_children:
+                continue
+            if path and path not in node_by_path:
+                continue
+            normalized_updates.append(
+                {
+                    "source_figma_id": source_figma_id,
+                    "path": path,
+                    "role": str(item.get("role", "unknown") or "unknown").lower().strip(),
+                    "semantic_name": str(item.get("semantic_name", "") or "").strip(),
+                    "parent_semantic_name": str(item.get("parent_semantic_name", "") or "").strip(),
+                    "confidence": float(item.get("confidence", 0.0) or 0.0),
+                    "reason": str(item.get("reason", "") or "").strip(),
+                }
+            )
+
+        normalized_groups: list[dict[str, Any]] = []
+        for item in parsed.get("groups") or []:
+            if not isinstance(item, dict):
+                continue
+            children = [str(x) for x in (item.get("children") or []) if str(x) in allowed_children]
+            if not children:
+                continue
+            normalized_groups.append(
+                {
+                    "id": str(item.get("id", "") or ""),
+                    "role": str(item.get("role", "unknown") or "unknown").lower().strip(),
+                    "semantic_name": str(item.get("semantic_name", "") or "").strip(),
+                    "parent_semantic_name": str(item.get("parent_semantic_name", "") or "").strip(),
+                    "children": children,
+                    "confidence": float(item.get("confidence", 0.0) or 0.0),
+                    "reason": str(item.get("reason", "") or "").strip(),
+                }
+            )
+
+        out["updates"] = normalized_updates
+        out["groups"] = normalized_groups
+        out["semantic_relations"] = list(parsed.get("semantic_relations", []) or [])
+        out["layout_constraints"] = list(parsed.get("layout_constraints", []) or [])
+        return out
+
+    def annotate_scene(self, request: SceneAnnotateRequest) -> dict[str, Any]:
+        image: Optional[Image.Image] = None
+        if request.banner_image_path:
+            image = self._load_image(request.banner_image_path)
+            image = self._prepare_image_for_model(image, "annotate_scene/banner")
+            ar = _aspect_ratio(image)
+            logger.info(
+                "annotate_scene preprocessing: banner=%dx%d aspect=%.2f threshold=%.0f",
+                image.width,
+                image.height,
+                ar,
+                _QWEN_SAFE_MAX_ASPECT_RATIO,
+            )
+            if _is_extreme_aspect_ratio(image):
+                logger.warning("annotate_scene: extreme aspect ratio, heuristic fallback ar=%.2f", ar)
+                out = self._scene_heuristic_fallback(request)
+                out["heuristic_fallback"] = True
+                return out
+
+        prompt = self._build_scene_prompt(request)
+        mtokens = max(512, min(768, int(self.max_new_tokens)))
+        images = [image] if image is not None else []
+        logger.info(
+            "annotate_scene calling model (single pass, max_new_tokens=%s temperature=%.2f do_sample=%s)",
+            mtokens,
+            self.temperature,
+            self.temperature > 0,
+        )
+        raw_output = self._run_model(images, prompt, max_new_tokens=mtokens)
+        parsed = self._extract_json(raw_output)
+        if not isinstance(parsed, dict):
+            logger.warning("annotate_scene: JSON parse failed, heuristic fallback")
+            out = self._scene_heuristic_fallback(request)
+            out["raw_model_output"] = raw_output
+            out["heuristic_fallback"] = True
+            return out
+
+        out = self._finalize_scene_response(parsed, request, raw_output)
+        out["heuristic_fallback"] = False
+        return out
+
+    def annotate_semantic_structure(self, request: SemanticStructureAnnotateRequest) -> dict[str, Any]:
+        # Backward-compatible alias for older clients.
+        scene_req = SceneAnnotateRequest(
+            banner_metadata=request.figma_summary.get("canvas") or {},
+            elements=request.figma_summary.get("nodes") or [],
+            groups=request.figma_summary.get("candidates") or [],
+            heuristic_roles={},
+            figma_summary=request.figma_summary,
+            banner_image_path=request.banner_image_path,
+        )
+        return self.annotate_scene(scene_req)
+
 
 def create_app(
     model_path: str,
     device: str = "cuda:1",
-    max_new_tokens: int = 512,
-    temperature: float = 0.1,
-    max_image_long_side: int = 1600,
+    max_new_tokens: int = 768,
+    temperature: float = 0.0,
+    max_image_long_side: int = 1024,
 ) -> FastAPI:
     app = FastAPI(title="Qwen Layout Annotation Service")
     runtime = QwenRuntime(
@@ -1216,5 +1864,21 @@ def create_app(
                 status_code=500,
                 detail=f"candidate_id={cid!r}: {type(e).__name__}: {e}",
             ) from e
+
+    @app.post("/annotate/semantic-structure")
+    def annotate_semantic_structure(request: SemanticStructureAnnotateRequest) -> dict[str, Any]:
+        try:
+            return runtime.annotate_semantic_structure(request)
+        except Exception as e:
+            logger.exception("annotate_semantic_structure failed")
+            raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}") from e
+
+    @app.post("/annotate/scene")
+    def annotate_scene(request: SceneAnnotateRequest) -> dict[str, Any]:
+        try:
+            return runtime.annotate_scene(request)
+        except Exception as e:
+            logger.exception("annotate_scene failed")
+            raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}") from e
 
     return app

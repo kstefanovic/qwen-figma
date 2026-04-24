@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 from typing import Any
 
 from banner_pipeline.build_candidates import CandidateBundle, SemanticCandidate
@@ -125,6 +126,10 @@ def _left_region(candidate: SemanticCandidate) -> bool:
     return candidate.x_norm <= 0.45
 
 
+def _left_or_middle_region(candidate: SemanticCandidate) -> bool:
+    return candidate.center_x_norm <= 0.62
+
+
 def _right_region(candidate: SemanticCandidate) -> bool:
     return candidate.x_norm >= 0.70
 
@@ -145,6 +150,11 @@ def _long_text(candidate: SemanticCandidate) -> bool:
     return _char_count(candidate) >= 40
 
 
+def _text_density(candidate: SemanticCandidate) -> float:
+    area = max(candidate.area_ratio, 1e-6)
+    return _char_count(candidate) / area
+
+
 def _contains_digits(candidate: SemanticCandidate) -> bool:
     return any(ch.isdigit() for ch in _safe_text(candidate))
 
@@ -152,7 +162,7 @@ def _contains_digits(candidate: SemanticCandidate) -> bool:
 def _looks_like_age_badge_text(candidate: SemanticCandidate) -> bool:
     text = _safe_text(candidate)
     normalized = text.replace(" ", "")
-    return normalized in {"0+", "6+", "12+", "16+", "18+"}
+    return bool(re.fullmatch(r"(0|3|6|12|16|18)\+", normalized))
 
 
 def _looks_like_price(candidate: SemanticCandidate) -> bool:
@@ -160,10 +170,17 @@ def _looks_like_price(candidate: SemanticCandidate) -> bool:
     if not text:
         return False
 
+    normalized = text.replace(" ", "")
+    if re.fullmatch(r"(0|3|6|12|16|18)\+", normalized):
+        return False
+
     currency_tokens = ["₽", "$", "€", "руб", "руб.", "сом", "тенге", "₸", "uah", "грн"]
     has_currency = any(tok in text for tok in currency_tokens)
     has_digits = _contains_digits(candidate)
-    return has_digits and (has_currency or len(text) <= 10)
+    pricing_tokens = ["от ", "за ", "скид", "%", "sale", "off"]
+    has_pricing_token = any(tok in text for tok in pricing_tokens)
+    numeric_price_pattern = bool(re.search(r"\d[\d\s]*([.,]\d{1,2})?\s*(₽|\$|€|руб|руб\.|₸|грн)", text))
+    return has_digits and (has_currency or has_pricing_token or numeric_price_pattern)
 
 
 def _looks_like_discount(candidate: SemanticCandidate) -> bool:
@@ -191,8 +208,14 @@ def _looks_like_legal(candidate: SemanticCandidate) -> bool:
         "terms", "conditions", "disclaimer"
     ]
     marker_hit = any(marker in text for marker in legal_markers)
+    if marker_hit:
+        return True
 
-    return _long_text(candidate) or marker_hit
+    # Long text alone is not enough: large promo headlines can be long too.
+    # Legal copy is usually dense, smaller, and/or anchored near the bottom edge.
+    dense_copy = _text_density(candidate) >= 1200.0
+    compact_block = candidate.h_norm <= 0.16 and candidate.w_norm <= 0.45
+    return _long_text(candidate) and _bottom_region(candidate) and (dense_copy or compact_block)
 
 
 def _looks_like_headline(candidate: SemanticCandidate) -> bool:
@@ -203,7 +226,9 @@ def _looks_like_headline(candidate: SemanticCandidate) -> bool:
     if _looks_like_price(candidate):
         return False
 
-    return candidate.area_ratio >= 0.05 and _left_region(candidate) and _word_count(candidate) >= 2
+    has_prominent_bounds = candidate.area_ratio >= 0.05 or candidate.h_norm >= 0.14 or candidate.w_norm >= 0.35
+    has_multiword_copy = _word_count(candidate) >= 2
+    return has_prominent_bounds and _left_or_middle_region(candidate) and has_multiword_copy
 
 
 def _looks_like_subheadline(candidate: SemanticCandidate) -> bool:
@@ -327,10 +352,10 @@ def _annotate_candidate_type_priors(
             HeuristicDecision(
                 rule_name="candidate_type_badge",
                 assigned_role_hint=role,
-                assigned_group_hint="badge_group",
+                assigned_group_hint="badge_group" if role == "age_badge" else "badge_group",
                 assigned_importance_hint="high",
-                confidence=0.88,
-                reason="Small short text in top-right behaves like badge.",
+                confidence=0.96 if role == "age_badge" else 0.82,
+                reason="Top-right short text matches age-rating badge." if role == "age_badge" else "Small short text in top-right behaves like badge.",
             ),
         )
 
@@ -424,6 +449,20 @@ def _annotate_text_specific_rules(
         )
         return
 
+    if _looks_like_age_badge_text(candidate):
+        _assign(
+            annotated,
+            HeuristicDecision(
+                rule_name="text_age_badge_anywhere",
+                assigned_role_hint="age_badge",
+                assigned_group_hint="badge_group",
+                assigned_importance_hint="high",
+                confidence=0.90,
+                reason="Text matches age-rating pattern and should not be treated as price.",
+            ),
+        )
+        return
+
     if _looks_like_legal(candidate) and _bottom_region(candidate):
         _assign(
             annotated,
@@ -493,6 +532,71 @@ def _annotate_text_specific_rules(
                 reason="Large prominent left-side multi-word text.",
             ),
         )
+
+
+def _annotate_spatial_visual_rules(
+    annotated: HeuristicAnnotatedCandidate,
+    nodes_map: dict[str, CollapsedNode],
+) -> None:
+    candidate = annotated.candidate
+    nodes = _candidate_nodes(candidate, nodes_map)
+
+    if candidate.candidate_type == "brand" and _top_region(candidate) and _left_or_middle_region(candidate):
+        _assign(
+            annotated,
+            HeuristicDecision(
+                rule_name="brand_top_left_mark",
+                assigned_role_hint="brand_mark",
+                assigned_group_hint="brand_group",
+                assigned_importance_hint="critical",
+                confidence=0.97,
+                reason="Top-left visual/logo cluster strongly indicates brand mark.",
+            ),
+        )
+        return
+
+    if candidate.candidate_type == "background":
+        _assign(
+            annotated,
+            HeuristicDecision(
+                rule_name="background_shape_spatial",
+                assigned_role_hint="background_shape",
+                assigned_group_hint="background_group",
+                assigned_importance_hint="medium",
+                confidence=0.90,
+                reason="Large non-text shape spanning a major region behaves like background shape.",
+            ),
+        )
+        return
+
+    if candidate.candidate_type == "image_like":
+        if candidate.area_ratio >= 0.12 and candidate.center_x_norm >= 0.58:
+            _assign(
+                annotated,
+                HeuristicDecision(
+                    rule_name="image_like_right_hero",
+                    assigned_role_hint="hero_photo",
+                    assigned_group_hint="hero_group",
+                    assigned_importance_hint="high",
+                    confidence=0.90,
+                    reason="Large right-side image-like region strongly suggests hero image.",
+                ),
+            )
+            return
+
+        has_shape_like = any(n.type.lower() in {"vector", "rectangle", "ellipse", "star"} for n in nodes)
+        if has_shape_like and candidate.area_ratio >= 0.18:
+            _assign(
+                annotated,
+                HeuristicDecision(
+                    rule_name="image_like_large_backgroundish",
+                    assigned_role_hint="background_shape",
+                    assigned_group_hint="background_group",
+                    assigned_importance_hint="medium",
+                    confidence=0.72,
+                    reason="Very large shape-like image region is more likely background than foreground content.",
+                ),
+            )
 
 
 def _annotate_text_group_rules(
@@ -649,9 +753,9 @@ def _bucketize(bundle: HeuristicBundle) -> None:
             bundle.badge_candidates.append(cid)
         elif role == "decoration":
             bundle.decoration_candidates.append(cid)
-        elif role == "brand":
+        elif role in {"brand", "brand_mark"}:
             bundle.brand_candidates.append(cid)
-        elif role == "background":
+        elif role in {"background", "background_shape"}:
             bundle.background_candidates.append(cid)
 
 
@@ -670,6 +774,7 @@ def apply_heuristics(
         _annotate_candidate_type_priors(ann)
         _annotate_text_specific_rules(ann)
         _annotate_text_group_rules(ann)
+        _annotate_spatial_visual_rules(ann, nodes_map)
         _annotate_brand_confidence_boost(ann, nodes_map)
 
         annotations.append(ann)

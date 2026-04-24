@@ -56,7 +56,12 @@ class ConvertRequest(BaseModel):
     raw_json: dict[str, Any]
     target_width: int = Field(gt=0)
     target_height: int = Field(gt=0)
-    use_qwen: bool = True
+    mode: Literal["apply_to_clone_fast", "apply_to_clone_vlm", "full_layout_debug"] = "apply_to_clone_fast"
+    use_qwen: bool = False
+    qwen_mode: Optional[str] = Field(
+        default=None,
+        description="scene_only, single_pass, per_candidate legacy, or off. Ignored when use_qwen is false.",
+    )
     brand_family: Optional[str] = None
     language: Optional[str] = None
     category: Optional[str] = None
@@ -81,6 +86,10 @@ class LayoutUpdateItem(BaseModel):
     path: Optional[str] = None
     name: Optional[str] = None
     role: str
+    semantic_name: str
+    parent_semantic_name: Optional[str] = None
+    confidence: float = 0.0
+    reason: str = ""
     bounds: LayoutBounds
 
 
@@ -92,11 +101,44 @@ class ConvertFrameSpec(BaseModel):
 class ConvertDebug(BaseModel):
     semantic_graph_path: str
     validation_report_path: Optional[str] = None
+    qwen_call_count: int = 0
+    qwen_mode: Optional[str] = None
+    stage_timings: dict[str, float] = Field(default_factory=dict)
+    nodes_annotated: int = 0
+    nodes_left_unnamed: int = 0
+    validation_warnings: list[str] = Field(default_factory=list)
+    low_confidence_examples: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class ConvertSemanticElement(BaseModel):
+    id: str
+    figma_node_id: str
+    path: Optional[str] = None
+    role: str
+    semantic_name: str
+    parent_semantic_name: Optional[str] = None
+    confidence: float = 0.0
+    reason: str = ""
+
+
+class ConvertSemanticGroup(BaseModel):
+    id: str
+    role: str
+    semantic_name: str
+    children: list[str] = Field(default_factory=list)
+    confidence: float = 0.0
+    reason: str = ""
+
+
+class ConvertSemanticSummary(BaseModel):
+    elements: list[ConvertSemanticElement] = Field(default_factory=list)
+    groups: list[ConvertSemanticGroup] = Field(default_factory=list)
 
 
 class ConvertResponse(BaseModel):
     run_id: str
-    mode: Literal["apply_to_clone"] = "apply_to_clone"
+    mode: Literal["apply_to_clone_fast", "apply_to_clone_vlm", "full_layout_debug"]
     frame: ConvertFrameSpec
     updates: list[LayoutUpdateItem]
+    semantic: ConvertSemanticSummary
     debug: ConvertDebug

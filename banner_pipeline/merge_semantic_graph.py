@@ -238,8 +238,9 @@ def _resolve_role_hint(heuristic_ann: Optional[HeuristicAnnotatedCandidate], qwe
     heuristic_role = heuristic_ann.final_role_hint if heuristic_ann else None
     qwen_role = qwen_ann.element_role if qwen_ann else None
     qwen_conf = qwen_ann.confidence if qwen_ann else 0.0
+    qwen_role_low_info = qwen_role in {"unknown", "text", "image_like", "background"}
 
-    if qwen_role and qwen_conf >= config.qwen_low_confidence_threshold:
+    if qwen_role and not qwen_role_low_info and qwen_conf >= config.qwen_low_confidence_threshold:
         return qwen_role
     if heuristic_role:
         return heuristic_role
@@ -250,8 +251,9 @@ def _resolve_group_hint(heuristic_ann: Optional[HeuristicAnnotatedCandidate], qw
     heuristic_group = heuristic_ann.final_group_hint if heuristic_ann else None
     qwen_group = qwen_group_ann.group_role if qwen_group_ann else None
     qwen_conf = qwen_group_ann.confidence if qwen_group_ann else 0.0
+    qwen_group_low_info = qwen_group in {"unknown", "text_group"}
 
-    if qwen_group and qwen_conf >= config.qwen_low_confidence_threshold:
+    if qwen_group and not qwen_group_low_info and qwen_conf >= config.qwen_low_confidence_threshold:
         return qwen_group
     if heuristic_group:
         return heuristic_group
@@ -484,6 +486,21 @@ def _candidate_to_element_role(
 ) -> ElementRole:
     resolved = _resolve_role_hint(heuristic_ann, qwen_candidate_ann, config)
 
+    if resolved in {None, "unknown", "text"}:
+        group_hint = heuristic_ann.final_group_hint if heuristic_ann is not None else None
+        group_to_element = {
+            "headline_group": "headline",
+            "legal_group": "legal",
+            "brand_group": "brand_mark",
+            "badge_group": "age_badge",
+            "hero_group": "hero_photo",
+            "background_group": "background_shape",
+            "text_group": "text_container",
+        }
+        mapped = group_to_element.get(group_hint)
+        if mapped is not None:
+            resolved = mapped
+
     if resolved is None:
         by_type = {
             "text": "unknown",
@@ -491,8 +508,8 @@ def _candidate_to_element_role(
             "brand": "brand_mark",
             "badge": "badge_text",
             "decoration": "decoration",
-            "background": "background_panel",
-            "image_like": "product_image",
+            "background": "background_shape",
+            "image_like": "hero_photo",
         }
         resolved = by_type.get(candidate.candidate_type, "unknown")
 

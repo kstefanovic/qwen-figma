@@ -8,6 +8,8 @@ module.exports = {
       interpreter: "none",
       env: {
         QWEN_BASE_URL: "http://127.0.0.1:10196",
+        USE_QWEN_SCENE_ONLY: "true",
+        DEBUG_SAVE_ARTIFACTS: "true",
         PYTHONUNBUFFERED: "1"
       },
       autorestart: true,
@@ -27,6 +29,9 @@ module.exports = {
         QWEN_DEVICE: "cuda:1",
         QWEN_HOST: "127.0.0.1",
         QWEN_PORT: "10196",
+        QWEN_MAX_NEW_TOKENS: "768",
+        QWEN_TEMPERATURE: "0.0",
+        QWEN_MAX_IMAGE_LONG_SIDE: "1024",
         PYTHONUNBUFFERED: "1"
       },
       autorestart: true,

@@ -461,40 +461,53 @@ def _bundle_source_node_ids(candidates: list[SemanticCandidate]) -> set[str]:
 
 
 def _build_decoration_candidates(nodes: list[CollapsedNode], bundle: CandidateBundle) -> None:
-    decoration_idx = 1
     brand_node_ids = _bundle_source_node_ids(bundle.brand_candidates)
-
+    decoration_nodes: list[CollapsedNode] = []
     for node in nodes:
         if node.id in brand_node_ids:
             continue
-
         if _is_star_like(node):
-            candidate = _candidate_from_nodes(
-                candidate_id=f"decoration_{decoration_idx}",
-                candidate_type="decoration",
-                nodes=[node],
-                role_hint="decoration",
-                group_hint="decoration_group",
-                importance_hint="low",
-                extra_data={"grouping_reason": "star_shape"},
-            )
-            _add_candidate(bundle, candidate)
-            decoration_idx += 1
+            decoration_nodes.append(node)
             continue
+        if _is_shape_like(node) and not _is_large_background_like(node) and node.area_ratio <= 0.06:
+            decoration_nodes.append(node)
 
-        if _is_shape_like(node) and not _is_large_background_like(node):
-            if node.area_ratio <= 0.06:
-                candidate = _candidate_from_nodes(
-                    candidate_id=f"decoration_{decoration_idx}",
-                    candidate_type="decoration",
-                    nodes=[node],
-                    role_hint="decoration",
-                    group_hint="decoration_group",
-                    importance_hint="low",
-                    extra_data={"grouping_reason": "small_shape_like"},
-                )
-                _add_candidate(bundle, candidate)
-                decoration_idx += 1
+    if not decoration_nodes:
+        return
+
+    clusters: list[list[CollapsedNode]] = []
+    for node in sorted(decoration_nodes, key=lambda n: (n.y_norm, n.x_norm)):
+        matched_cluster: list[CollapsedNode] | None = None
+        node_is_star = _is_star_like(node)
+        for cluster in clusters:
+            seed = cluster[0]
+            same_family = _is_star_like(seed) == node_is_star
+            close_x = abs(node.center_x_norm - seed.center_x_norm) <= 0.18
+            close_y = abs(node.center_y_norm - seed.center_y_norm) <= 0.18
+            similar_area = 0.35 <= (min(node.area_ratio, seed.area_ratio) / max(node.area_ratio, seed.area_ratio, 1e-6)) <= 1.0
+            if same_family and close_x and close_y and similar_area:
+                matched_cluster = cluster
+                break
+        if matched_cluster is None:
+            clusters.append([node])
+        else:
+            matched_cluster.append(node)
+
+    for decoration_idx, cluster in enumerate(clusters, start=1):
+        grouping_reason = "star_family_cluster" if any(_is_star_like(n) for n in cluster) else "small_shape_cluster"
+        candidate = _candidate_from_nodes(
+            candidate_id=f"decoration_{decoration_idx}",
+            candidate_type="decoration",
+            nodes=cluster,
+            role_hint="decoration",
+            group_hint="decoration_group",
+            importance_hint="low",
+            extra_data={
+                "grouping_reason": grouping_reason,
+                "member_count": len(cluster),
+            },
+        )
+        _add_candidate(bundle, candidate)
 
 
 def _build_background_candidates(nodes: list[CollapsedNode], bundle: CandidateBundle) -> None:

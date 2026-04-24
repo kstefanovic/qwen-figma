@@ -23,6 +23,8 @@ class PipelineRunner:
         language: str | None = None,
         category: str | None = None,
         use_qwen: bool = True,
+        qwen_mode: str | None = "single_pass",
+        pipeline_mode: str = "full_layout_debug",
     ) -> dict[str, Any]:
         try:
             self.storage.update_meta(
@@ -33,6 +35,8 @@ class PipelineRunner:
                     "language_override": language,
                     "category_override": category,
                     "use_qwen": use_qwen,
+                    "qwen_mode": (qwen_mode or "single_pass") if use_qwen else "off",
+                    "pipeline_mode": pipeline_mode,
                     "qwen_base_url": self.qwen_base_url if use_qwen else None,
                 },
             )
@@ -50,6 +54,8 @@ class PipelineRunner:
                 brand_family=brand_family,
                 language=language,
                 category=category,
+                qwen_mode=qwen_mode if use_qwen else "off",
+                pipeline_mode=pipeline_mode,
             )
 
             semantic_graph_path = self.storage.get_final_dir(run_id) / "semantic_graph.json"
@@ -57,7 +63,9 @@ class PipelineRunner:
 
             brand_ctx_path = None
             if result.get("brand_context_annotation") is not None:
-                brand_ctx_path = str(self.storage.get_intermediate_dir(run_id) / "05b_brand_context.json")
+                candidate_path = self.storage.get_intermediate_dir(run_id) / "05b_brand_context.json"
+                if candidate_path.exists():
+                    brand_ctx_path = str(candidate_path)
 
             self.storage.update_meta(
                 run_id,
@@ -67,6 +75,12 @@ class PipelineRunner:
                     "language": result["resolved_language"],
                     "category": result["resolved_category"],
                     "brand_context_json": brand_ctx_path,
+                    "pipeline_mode": result.get("pipeline_mode"),
+                    "qwen_mode": result.get("qwen_mode"),
+                    "qwen_call_count": result.get("qwen_calls_made"),
+                    "qwen_elapsed_seconds": result.get("qwen_elapsed_seconds"),
+                    "stage_timings": result.get("stage_timings"),
+                    "qwen_request_metrics": result.get("qwen_request_metrics"),
                 },
                 output_files={
                     "semantic_graph": str(semantic_graph_path),

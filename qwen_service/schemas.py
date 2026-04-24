@@ -31,6 +31,27 @@ class BrandContextAnnotateRequest(BaseModel):
     heuristic_bundle: Optional[dict[str, Any]] = None
 
 
+class SemanticStructureAnnotateRequest(BaseModel):
+    """Single-pass VLM: full banner + compact Figma summary (nodes + candidates + heuristic hints)."""
+
+    banner_image_path: str
+    figma_summary: dict[str, Any]
+
+
+class SceneAnnotateRequest(BaseModel):
+    """
+    Single-pass scene annotation payload:
+    compact metadata + Figma-derived elements/groups/heuristics + optional banner image path.
+    """
+
+    banner_metadata: dict[str, Any]
+    elements: list[dict[str, Any]]
+    groups: list[dict[str, Any]]
+    heuristic_roles: dict[str, Any] = Field(default_factory=dict)
+    figma_summary: Optional[dict[str, Any]] = None
+    banner_image_path: Optional[str] = None
+
+
 class HealthResponse(BaseModel):
     status: str
     model_loaded: bool
