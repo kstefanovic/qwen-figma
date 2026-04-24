@@ -19,9 +19,9 @@ class PipelineRunner:
         run_id: str,
         raw_json_path: str | Path,
         banner_image_path: str | Path,
-        brand_family: str = "unknown_brand",
-        language: str = "unknown",
-        category: str = "unknown",
+        brand_family: str | None = None,
+        language: str | None = None,
+        category: str | None = None,
         use_qwen: bool = True,
     ) -> dict[str, Any]:
         try:
@@ -29,9 +29,9 @@ class PipelineRunner:
                 run_id,
                 status="running",
                 metadata={
-                    "brand_family": brand_family,
-                    "language": language,
-                    "category": category,
+                    "brand_family_override": brand_family,
+                    "language_override": language,
+                    "category_override": category,
                     "use_qwen": use_qwen,
                     "qwen_base_url": self.qwen_base_url if use_qwen else None,
                 },
@@ -47,17 +47,27 @@ class PipelineRunner:
                 output_dir=str(output_dir),
                 use_qwen=use_qwen,
                 qwen_base_url=self.qwen_base_url,
-                default_brand_family=brand_family,
-                default_language=language,
-                default_category=category,
+                brand_family=brand_family,
+                language=language,
+                category=category,
             )
 
             semantic_graph_path = self.storage.get_final_dir(run_id) / "semantic_graph.json"
             validation_report_path = self.storage.get_final_dir(run_id) / "validation_report.json"
 
+            brand_ctx_path = None
+            if result.get("brand_context_annotation") is not None:
+                brand_ctx_path = str(self.storage.get_intermediate_dir(run_id) / "05b_brand_context.json")
+
             self.storage.update_meta(
                 run_id,
                 status="completed",
+                metadata={
+                    "brand_family": result["resolved_brand_family"],
+                    "language": result["resolved_language"],
+                    "category": result["resolved_category"],
+                    "brand_context_json": brand_ctx_path,
+                },
                 output_files={
                     "semantic_graph": str(semantic_graph_path),
                     "validation_report": str(validation_report_path),

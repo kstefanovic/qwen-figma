@@ -23,7 +23,13 @@ try:
 except AttributeError:
     _LANCZOS = Image.LANCZOS  # type: ignore[attr-defined]
 
-from qwen_service.schemas import BannerAnnotateRequest, CandidateAnnotateRequest, GroupAnnotateRequest, HealthResponse
+from qwen_service.schemas import (
+    BannerAnnotateRequest,
+    BrandContextAnnotateRequest,
+    CandidateAnnotateRequest,
+    GroupAnnotateRequest,
+    HealthResponse,
+)
 
 try:
     import torch
@@ -110,6 +116,140 @@ class GroupAnnotation:
             "reason_short": self.reason_short,
             "raw_model_output": self.raw_model_output,
         }
+
+
+@dataclass
+class BrandContextAnnotation:
+    brand_family: str = "generic"
+    brand_confidence: float = 0.0
+    language: str = "unknown"
+    category: str = "unknown"
+    reason_short: str = ""
+    raw_model_output: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "brand_family": self.brand_family,
+            "brand_confidence": self.brand_confidence,
+            "language": self.language,
+            "category": self.category,
+            "reason_short": self.reason_short,
+            "raw_model_output": self.raw_model_output,
+        }
+
+
+def _slugify_machine_brand(value: str) -> str:
+    s = (value or "").strip().lower().replace(" ", "_").replace("-", "_")
+    s = re.sub(r"[^a-z0-9_]+", "", s)
+    return s or "generic"
+
+
+def _normalize_language_code(value: str) -> str:
+    s = (value or "").strip().lower()
+    allowed = {"ru", "en", "kk", "mixed", "unknown"}
+    if s in allowed:
+        return s
+    if not s:
+        return "unknown"
+    if len(s) <= 3 and s.isalpha():
+        return s
+    return "unknown"
+
+
+def _normalize_category_code(value: str) -> str:
+    s = (value or "").strip().lower().replace(" ", "_").replace("-", "_")
+    s = re.sub(r"[^a-z0-9_]+", "", s)
+    if not s:
+        return "unknown"
+    return s
+
+
+def _compact_candidate_bundle_for_brand_context(candidate_bundle: Optional[dict[str, Any]]) -> dict[str, Any]:
+    if not candidate_bundle:
+        return {}
+    counts: dict[str, int] = {}
+    all_c = candidate_bundle.get("all_candidates") or []
+    for c in all_c:
+        if not isinstance(c, dict):
+            continue
+        t = str(c.get("candidate_type") or "unknown")
+        counts[t] = counts.get(t, 0) + 1
+    slim: list[dict[str, Any]] = []
+    for c in all_c[:20]:
+        if not isinstance(c, dict):
+            continue
+        tc = (c.get("text_content") or "") if isinstance(c.get("text_content"), str) else ""
+        slim.append(
+            {
+                "candidate_id": c.get("candidate_id"),
+                "candidate_type": c.get("candidate_type"),
+                "role_hint": c.get("role_hint"),
+                "text_preview": tc[:120],
+            }
+        )
+    return {"counts_by_candidate_type": counts, "sample_candidates": slim, "total_candidates": len(all_c)}
+
+
+def _compact_heuristic_bundle_for_brand_context(heuristic_bundle: Optional[dict[str, Any]]) -> dict[str, Any]:
+    if not heuristic_bundle:
+        return {}
+    return {
+        "headline_candidates": heuristic_bundle.get("headline_candidates", [])[:8],
+        "subheadline_candidates": heuristic_bundle.get("subheadline_candidates", [])[:8],
+        "legal_candidates": heuristic_bundle.get("legal_candidates", [])[:8],
+        "badge_candidates": heuristic_bundle.get("badge_candidates", [])[:8],
+        "brand_candidates": heuristic_bundle.get("brand_candidates", [])[:8],
+        "background_candidates": heuristic_bundle.get("background_candidates", [])[:8],
+        "decoration_candidates": heuristic_bundle.get("decoration_candidates", [])[:8],
+    }
+
+
+def _finalize_brand_context_output(data: Optional[dict[str, Any]], raw_output: str) -> BrandContextAnnotation:
+    """Apply conservative gates so missing or low-confidence inference never crashes downstream."""
+    if not isinstance(data, dict):
+        return BrandContextAnnotation(
+            brand_family="generic",
+            brand_confidence=0.0,
+            language="unknown",
+            category="unknown",
+            reason_short="Failed to parse brand-context JSON from model.",
+            raw_model_output=raw_output,
+        )
+
+    try:
+        conf = float(data.get("brand_confidence", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        conf = 0.0
+    conf = max(0.0, min(1.0, conf))
+
+    brand = _slugify_machine_brand(str(data.get("brand_family", "") or ""))
+    lang = _normalize_language_code(str(data.get("language", "") or ""))
+    cat = _normalize_category_code(str(data.get("category", "") or ""))
+
+    reason = str(data.get("reason_short", "") or "").strip()
+
+    low_conf = conf < 0.45
+    if low_conf:
+        brand = "generic"
+        if not reason:
+            reason = "Low brand_confidence; defaulted brand_family to generic."
+        elif "generic" not in reason.lower():
+            reason = f"{reason} (brand_family forced to generic due to low confidence.)"
+
+    if brand in {"", "unknown", "unk", "unknown_brand"}:
+        brand = "generic"
+
+    if lang == "unknown" and not low_conf and not reason:
+        reason = "Language unclear; using unknown."
+
+    return BrandContextAnnotation(
+        brand_family=brand,
+        brand_confidence=conf,
+        language=lang if lang else "unknown",
+        category=cat if cat else "unknown",
+        reason_short=reason or "Model-provided brand context.",
+        raw_model_output=raw_output,
+    )
 
 
 def _upscale_to_min_side(image: Image.Image, min_side: int) -> Image.Image:
@@ -725,6 +865,88 @@ Return JSON only:
 }}
 """.strip()
 
+    def _build_brand_context_prompt(
+        self,
+        candidate_bundle: Optional[dict[str, Any]],
+        heuristic_bundle: Optional[dict[str, Any]],
+    ) -> str:
+        compact_candidates = _compact_candidate_bundle_for_brand_context(candidate_bundle)
+        compact_heuristics = _compact_heuristic_bundle_for_brand_context(heuristic_bundle)
+        return f"""
+You are a brand and market-context analyst for digital advertising banners exported from Figma.
+
+Task:
+From the banner IMAGE plus the structured summaries below, infer likely brand context.
+Be conservative: if you are not reasonably confident about a specific retail brand name, use brand_family "generic".
+Do not invent famous brand names from weak evidence.
+
+Output rules:
+- brand_family: machine-friendly snake_case string (a-z, 0-9, underscore). Examples: yandex_lavka, generic, unknown_brand, nike, coca_cola
+- brand_confidence: number between 0 and 1 (how confident you are in brand_family specifically)
+- language: one of ru, en, kk, mixed, unknown (or a short ISO-like 2-3 letter code if obvious)
+- category: one of grocery, beverage, fashion, electronics, delivery, unknown, or another short snake_case category
+- reason_short: one or two sentences explaining the inference
+
+If the brand is unclear or could be many retailers: brand_family MUST be "generic" and brand_confidence <= 0.4.
+If language is unclear: language MUST be "unknown".
+If category is unclear: category MUST be "unknown".
+
+Compact candidate summary JSON:
+{json.dumps(compact_candidates, ensure_ascii=False, indent=2)}
+
+Compact heuristic summary JSON:
+{json.dumps(compact_heuristics, ensure_ascii=False, indent=2)}
+
+Return JSON only:
+{{
+  "brand_family": "...",
+  "brand_confidence": 0.0,
+  "language": "...",
+  "category": "...",
+  "reason_short": "..."
+}}
+""".strip()
+
+    def annotate_brand_context(self, request: BrandContextAnnotateRequest) -> BrandContextAnnotation:
+        image = self._load_image(request.banner_image_path)
+        image = self._prepare_image_for_model(image, "annotate_brand_context/banner")
+
+        ar = _aspect_ratio(image)
+        logger.info(
+            "annotate_brand_context preprocessing: banner=%dx%d aspect=%.2f threshold=%.0f",
+            image.width,
+            image.height,
+            ar,
+            _QWEN_SAFE_MAX_ASPECT_RATIO,
+        )
+        if _is_extreme_aspect_ratio(image):
+            logger.warning(
+                "annotate_brand_context using fallback (extreme banner aspect ratio) aspect=%.2f",
+                ar,
+            )
+            return BrandContextAnnotation(
+                brand_family="generic",
+                brand_confidence=0.25,
+                language="unknown",
+                category="unknown",
+                reason_short="Fallback: banner aspect ratio exceeded safe Qwen threshold for vision encoding.",
+                raw_model_output="",
+            )
+
+        prompt = self._build_brand_context_prompt(request.candidate_bundle, request.heuristic_bundle)
+        logger.info("annotate_brand_context calling model (single banner image)")
+        raw_output = self._run_model([image], prompt)
+        parsed = self._extract_json(raw_output)
+        out = _finalize_brand_context_output(parsed if isinstance(parsed, dict) else None, raw_output)
+        logger.info(
+            "annotate_brand_context result: brand_family=%r confidence=%.2f language=%r category=%r",
+            out.brand_family,
+            out.brand_confidence,
+            out.language,
+            out.category,
+        )
+        return out
+
     def annotate_banner(self, request: BannerAnnotateRequest) -> BannerAnnotation:
         image = self._load_image(request.banner_image_path)
         image = self._prepare_image_for_model(image, "annotate_banner/banner")
@@ -954,6 +1176,14 @@ def create_app(
     @app.get("/health", response_model=HealthResponse)
     def health() -> HealthResponse:
         return HealthResponse(status="ok", model_loaded=(runtime.model is not None and runtime.processor is not None), device=runtime.device, model_path=runtime.model_path)
+
+    @app.post("/annotate/brand-context")
+    def annotate_brand_context(request: BrandContextAnnotateRequest) -> dict[str, Any]:
+        try:
+            return runtime.annotate_brand_context(request).to_dict()
+        except Exception as e:
+            logger.exception("annotate_brand_context failed")
+            raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}") from e
 
     @app.post("/annotate/banner")
     def annotate_banner(request: BannerAnnotateRequest) -> dict[str, Any]:

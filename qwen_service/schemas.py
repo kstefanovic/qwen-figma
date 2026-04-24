@@ -25,6 +25,12 @@ class GroupAnnotateRequest(BaseModel):
     context_padding_ratio: float = Field(default=0.08, ge=0.0, le=1.0)
 
 
+class BrandContextAnnotateRequest(BaseModel):
+    banner_image_path: str
+    candidate_bundle: Optional[dict[str, Any]] = None
+    heuristic_bundle: Optional[dict[str, Any]] = None
+
+
 class HealthResponse(BaseModel):
     status: str
     model_loaded: bool

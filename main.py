@@ -50,9 +50,9 @@ def run_pipeline(
     output_dir: str | Path,
     use_qwen: bool = False,
     qwen_base_url: str = "http://127.0.0.1:8001",
-    default_brand_family: str = "unknown_brand",
-    default_language: str = "unknown",
-    default_category: str = "unknown",
+    brand_family: str | None = None,
+    language: str | None = None,
+    category: str | None = None,
 ) -> dict[str, Any]:
     output_dir = ensure_dir(output_dir)
     intermediate_dir = ensure_dir(output_dir / "intermediate")
@@ -79,10 +79,26 @@ def run_pipeline(
     banner_annotation = None
     candidate_annotations = {}
     group_annotations = {}
+    brand_context_annotation = None
 
     if use_qwen:
         annotator = QwenAnnotator(base_url=qwen_base_url)
         annotator.load_model()
+
+        brand_context_annotation = annotator.annotate_brand_context(
+            banner_image_path=str(banner_image_path),
+            candidate_bundle=candidate_bundle,
+            heuristic_bundle=heuristic_bundle,
+        )
+        save_json(brand_context_annotation.to_dict(), intermediate_dir / "05b_brand_context.json")
+
+        inferred_brand = brand_context_annotation.brand_family
+        inferred_language = brand_context_annotation.language
+        inferred_category = brand_context_annotation.category
+
+        resolved_brand_family = brand_family if brand_family is not None else inferred_brand
+        resolved_language = language if language is not None else inferred_language
+        resolved_category = category if category is not None else inferred_category
 
         banner_annotation = annotator.annotate_banner(
             banner_image_path=str(banner_image_path),
@@ -104,11 +120,15 @@ def run_pipeline(
             heuristic_bundle=heuristic_bundle,
         )
         save_json({k: v.to_dict() for k, v in group_annotations.items()}, intermediate_dir / "08_group_annotations.json")
+    else:
+        resolved_brand_family = brand_family if brand_family is not None else "generic"
+        resolved_language = language if language is not None else "unknown"
+        resolved_category = category if category is not None else "unknown"
 
     config = MergeConfig(
-        default_brand_family=default_brand_family,
-        default_language=default_language,
-        default_category=default_category,
+        default_brand_family=resolved_brand_family,
+        default_language=resolved_language,
+        default_category=resolved_category,
     )
 
     semantic_graph = merge_semantic_graph(
@@ -138,6 +158,7 @@ def run_pipeline(
     print(f"Output dir:    {output_dir}")
     print("-" * 70)
     print(f"Canvas size:   {canvas_w} x {canvas_h}")
+    print(f"Brand context: brand_family={resolved_brand_family} language={resolved_language} category={resolved_category}")
     print(f"Parsed nodes:  {len(parsed_nodes)}")
     print(f"Collapsed:     {len(collapsed_nodes)}")
     print(f"Candidates:    {len(candidate_bundle.all_candidates)}")
@@ -159,6 +180,10 @@ def run_pipeline(
         "banner_annotation": banner_annotation,
         "candidate_annotations": candidate_annotations,
         "group_annotations": group_annotations,
+        "brand_context_annotation": brand_context_annotation,
+        "resolved_brand_family": resolved_brand_family,
+        "resolved_language": resolved_language,
+        "resolved_category": resolved_category,
     }
 
 
@@ -169,9 +194,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=str, required=True, help="Directory for outputs")
     parser.add_argument("--use-qwen", action="store_true", help="Enable Qwen API annotation stage")
     parser.add_argument("--qwen-base-url", type=str, default="http://127.0.0.1:8001", help="Base URL of the running Qwen service")
-    parser.add_argument("--brand-family", type=str, default="unknown_brand")
-    parser.add_argument("--language", type=str, default="unknown")
-    parser.add_argument("--category", type=str, default="unknown")
+    parser.add_argument(
+        "--brand-family",
+        type=str,
+        default=None,
+        help="Optional override for inferred brand_family (snake_case). Omit to use Qwen inference when --use-qwen.",
+    )
+    parser.add_argument(
+        "--language",
+        type=str,
+        default=None,
+        help="Optional override for inferred language. Omit for automatic inference when --use-qwen.",
+    )
+    parser.add_argument(
+        "--category",
+        type=str,
+        default=None,
+        help="Optional override for inferred category. Omit for automatic inference when --use-qwen.",
+    )
     return parser
 
 
@@ -184,9 +224,9 @@ def main() -> None:
         output_dir=args.output_dir,
         use_qwen=args.use_qwen,
         qwen_base_url=args.qwen_base_url,
-        default_brand_family=args.brand_family,
-        default_language=args.language,
-        default_category=args.category,
+        brand_family=args.brand_family,
+        language=args.language,
+        category=args.category,
     )
 
 

@@ -1,16 +1,25 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import json
+import re
 from pathlib import Path
 from typing import Any, Optional
 
 import requests
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from backend.convert_scene import semantic_graph_to_layout_updates
 from backend.runner import PipelineRunner
 from backend.schemas import (
+    ConvertDebug,
+    ConvertFrameSpec,
+    ConvertRequest,
+    ConvertResponse,
+    LayoutUpdateItem,
     HealthResponse,
     RunCreateResponse,
     RunListItem,
@@ -23,6 +32,30 @@ from backend.storage import RunStorage
 
 RUNS_DIR = Path("runs")
 QWEN_BASE_URL = "http://127.0.0.1:10196"
+
+
+def _optional_form_str(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped if stripped else None
+
+
+def _decode_png_base64(data: str) -> bytes:
+    s = (data or "").strip()
+    if not s:
+        raise ValueError("banner_png_base64 is empty.")
+    if "base64," in s:
+        s = s.split("base64,", 1)[1]
+    s = re.sub(r"\s+", "", s)
+    try:
+        raw = base64.b64decode(s, validate=False)
+    except binascii.Error as e:
+        raise ValueError(f"Invalid base64 data: {e}") from e
+    if len(raw) < 8 or raw[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError("Decoded banner is not a PNG (expected PNG file signature).")
+    return raw
+
 
 app = FastAPI(title="Banner Pipeline Backend")
 
@@ -76,13 +109,104 @@ def health() -> HealthResponse:
     )
 
 
+@app.post("/api/convert", response_model=ConvertResponse)
+async def convert_from_plugin(body: ConvertRequest = Body(...)) -> ConvertResponse:
+    """
+    Figma plugin entrypoint: run pipeline, return layout updates for clone-and-apply (no placeholder scene).
+    """
+    try:
+        png_bytes = _decode_png_base64(body.banner_png_base64)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    brand_family_override = _optional_form_str(body.brand_family)
+    language_override = _optional_form_str(body.language)
+    category_override = _optional_form_str(body.category)
+
+    run_id = storage.create_run()
+
+    banner_path = storage.save_upload_bytes(run_id, "banner.png", png_bytes)
+    raw_json_path = storage.save_upload_bytes(
+        run_id,
+        "raw_figma.json",
+        json.dumps(body.raw_json, ensure_ascii=False).encode("utf-8"),
+    )
+
+    storage.update_meta(
+        run_id,
+        input_files={
+            "banner_image": banner_path,
+            "raw_json": raw_json_path,
+        },
+        metadata={
+            "source": "figma_plugin_convert",
+            "target_width": body.target_width,
+            "target_height": body.target_height,
+            "brand_family_override": brand_family_override,
+            "language_override": language_override,
+            "category_override": category_override,
+            "use_qwen": body.use_qwen,
+        },
+    )
+
+    try:
+        runner.run(
+            run_id=run_id,
+            raw_json_path=raw_json_path,
+            banner_image_path=banner_path,
+            brand_family=brand_family_override,
+            language=language_override,
+            category=category_override,
+            use_qwen=body.use_qwen,
+        )
+    except Exception as e:
+        meta = storage.read_meta(run_id)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Pipeline failed (run_id={run_id}, status={meta.get('status')}): {e}",
+        ) from e
+
+    meta = storage.read_meta(run_id)
+    sg_path = (meta.get("output_files") or {}).get("semantic_graph")
+    if not sg_path:
+        raise HTTPException(status_code=500, detail="semantic_graph path missing in run metadata after success.")
+    graph_path = Path(sg_path)
+    if not graph_path.exists():
+        raise HTTPException(status_code=500, detail=f"semantic_graph file not found: {graph_path}")
+
+    try:
+        semantic_graph = json.loads(graph_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read semantic_graph.json: {e}") from e
+
+    layout = semantic_graph_to_layout_updates(
+        semantic_graph,
+        body.raw_json,
+        body.target_width,
+        body.target_height,
+    )
+    vr_path = (meta.get("output_files") or {}).get("validation_report")
+    vr_str = str(vr_path) if vr_path else None
+
+    return ConvertResponse(
+        run_id=run_id,
+        mode="apply_to_clone",
+        frame=ConvertFrameSpec(**layout["frame"]),
+        updates=[LayoutUpdateItem.model_validate(u) for u in layout["updates"]],
+        debug=ConvertDebug(
+            semantic_graph_path=str(graph_path),
+            validation_report_path=vr_str,
+        ),
+    )
+
+
 @app.post("/api/run", response_model=RunCreateResponse)
 async def create_run(
     banner_image: UploadFile = File(...),
     raw_json: UploadFile = File(...),
-    brand_family: str = Form("unknown_brand"),
-    language: str = Form("unknown"),
-    category: str = Form("unknown"),
+    brand_family: Optional[str] = Form(default=None),
+    language: Optional[str] = Form(default=None),
+    category: Optional[str] = Form(default=None),
     use_qwen: bool = Form(True),
 ) -> RunCreateResponse:
     if not banner_image.filename:
@@ -95,6 +219,10 @@ async def create_run(
 
     if not raw_json.filename.lower().endswith(".json"):
         raise HTTPException(status_code=400, detail="raw_json must be a .json file.")
+
+    brand_family_override = _optional_form_str(brand_family)
+    language_override = _optional_form_str(language)
+    category_override = _optional_form_str(category)
 
     run_id = storage.create_run()
 
@@ -119,9 +247,9 @@ async def create_run(
             "raw_json": raw_json_path,
         },
         metadata={
-            "brand_family": brand_family,
-            "language": language,
-            "category": category,
+            "brand_family_override": brand_family_override,
+            "language_override": language_override,
+            "category_override": category_override,
             "use_qwen": use_qwen,
         },
     )
@@ -131,9 +259,9 @@ async def create_run(
             run_id=run_id,
             raw_json_path=raw_json_path,
             banner_image_path=banner_path,
-            brand_family=brand_family,
-            language=language,
-            category=category,
+            brand_family=brand_family_override,
+            language=language_override,
+            category=category_override,
             use_qwen=use_qwen,
         )
     except Exception as e:

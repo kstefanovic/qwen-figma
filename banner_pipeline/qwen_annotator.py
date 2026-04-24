@@ -89,6 +89,26 @@ class CandidateAnnotation:
 
 
 @dataclass
+class BrandContextAnnotation:
+    brand_family: str = "generic"
+    brand_confidence: float = 0.0
+    language: str = "unknown"
+    category: str = "unknown"
+    reason_short: str = ""
+    raw_model_output: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "brand_family": self.brand_family,
+            "brand_confidence": self.brand_confidence,
+            "language": self.language,
+            "category": self.category,
+            "reason_short": self.reason_short,
+            "raw_model_output": self.raw_model_output,
+        }
+
+
+@dataclass
 class GroupAnnotation:
     candidate_id: str
     is_meaningful_group: bool = True
@@ -142,6 +162,27 @@ class QwenAnnotator:
         if not resp.ok:
             raise RuntimeError(_format_qwen_service_http_error("/health", resp))
         return resp.json()
+
+    def annotate_brand_context(
+        self,
+        banner_image_path: str,
+        candidate_bundle: Optional[CandidateBundle] = None,
+        heuristic_bundle: Optional[HeuristicBundle] = None,
+    ) -> BrandContextAnnotation:
+        payload: dict[str, Any] = {
+            "banner_image_path": banner_image_path,
+            "candidate_bundle": candidate_bundle.to_dict() if candidate_bundle else None,
+            "heuristic_bundle": heuristic_bundle.to_dict() if heuristic_bundle else None,
+        }
+        data = self._post("/annotate/brand-context", payload)
+        return BrandContextAnnotation(
+            brand_family=str(data.get("brand_family", "generic") or "generic"),
+            brand_confidence=float(data.get("brand_confidence", 0.0) or 0.0),
+            language=str(data.get("language", "unknown") or "unknown"),
+            category=str(data.get("category", "unknown") or "unknown"),
+            reason_short=str(data.get("reason_short", "")),
+            raw_model_output=str(data.get("raw_model_output", "")),
+        )
 
     def annotate_banner(
         self,

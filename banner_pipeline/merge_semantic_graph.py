@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+ZONE_DEFAULT_ID = "zone_default"
 
 from banner_pipeline.build_candidates import CandidateBundle, SemanticCandidate
 from banner_pipeline.collapse_groups import CollapsedNode
@@ -149,6 +154,49 @@ def _bbox_from_candidate(candidate: SemanticCandidate) -> BBox:
 
 def _bbox_full() -> BBox:
     return BBox(x=0.0, y=0.0, w=1.0, h=1.0)
+
+
+def _zone_registry_ids(zones: list[Zone]) -> set[str]:
+    """Central registry of valid zone ids for the current merge."""
+    return {z.id for z in zones}
+
+
+def _ensure_zone_default_registry(zones: list[Zone]) -> None:
+    """
+    Guarantee ZONE_DEFAULT_ID exists: full-canvas overlay used when layout/Qwen
+    references a zone id that is not in the banner-derived zone list.
+    """
+    if any(z.id == ZONE_DEFAULT_ID for z in zones):
+        return
+    zones.append(
+        Zone(
+            id=ZONE_DEFAULT_ID,
+            role=ZoneRole.OVERLAY_ZONE,
+            bbox_canvas=_bbox_full(),
+            importance=ImportanceLevel.MEDIUM,
+        )
+    )
+
+
+def _coerce_zone_id(zone_id: str, registry: set[str], *, log_context: str = "") -> str:
+    """
+    Map any zone_id to a member of registry. Never trust guessed/Qwen-aligned ids blindly.
+    """
+    if zone_id in registry:
+        return zone_id
+    logger.warning(
+        "Unknown zone_id from Qwen/layout: %r (%s), fallback applied -> %r",
+        zone_id,
+        log_context or "merge",
+        ZONE_DEFAULT_ID,
+    )
+    if ZONE_DEFAULT_ID in registry:
+        return ZONE_DEFAULT_ID
+    if registry:
+        fallback = sorted(registry)[0]
+        logger.warning("zone_default missing from registry; using first zone %r", fallback)
+        return fallback
+    raise RuntimeError("merge_semantic_graph: zone registry is empty after _ensure_zone_default_registry")
 
 
 def _count_words(text: Optional[str]) -> int:
@@ -658,7 +706,8 @@ def merge_semantic_graph(
 
     layout_pattern = _safe_layout_pattern(banner_annotation.layout_pattern if banner_annotation else None)
     zones = _zones_from_banner_annotation(banner_annotation, layout_pattern)
-    zone_ids = {z.id for z in zones}
+    _ensure_zone_default_registry(zones)
+    zone_registry = _zone_registry_ids(zones)
 
     source = SourceInfo(
         canvas_width=canvas_width,
@@ -699,20 +748,32 @@ def merge_semantic_graph(
             continue
 
         zone_id = _guess_zone_id_from_position(candidate, layout_pattern)
-        if zone_id not in zone_ids:
-            zone_id = "zone_overlay_global"
+        zone_id = _coerce_zone_id(
+            zone_id,
+            zone_registry,
+            log_context=f"group:{candidate.candidate_id}:layout_guess",
+        )
 
         if group_role == GroupRole.BADGE_GROUP:
-            zone_id = "zone_overlay_global"
+            zone_id = _coerce_zone_id(
+                "zone_overlay_global",
+                zone_registry,
+                log_context=f"group:{candidate.candidate_id}:badge",
+            )
         if candidate.candidate_type == "image_like":
-            zone_id = "zone_image_right" if "zone_image_right" in zone_ids else "zone_overlay_global"
+            prefer = "zone_image_right" if "zone_image_right" in zone_registry else "zone_overlay_global"
+            zone_id = _coerce_zone_id(prefer, zone_registry, log_context=f"group:{candidate.candidate_id}:image_like")
         if candidate.candidate_type == "background":
-            if candidate.center_x_norm < 0.5 and "zone_text_left" in zone_ids:
-                zone_id = "zone_text_left"
-            elif candidate.center_x_norm >= 0.5 and "zone_image_right" in zone_ids:
-                zone_id = "zone_image_right"
+            if candidate.center_x_norm < 0.5 and "zone_text_left" in zone_registry:
+                zone_id = _coerce_zone_id("zone_text_left", zone_registry, log_context=f"group:{candidate.candidate_id}:background_left")
+            elif candidate.center_x_norm >= 0.5 and "zone_image_right" in zone_registry:
+                zone_id = _coerce_zone_id("zone_image_right", zone_registry, log_context=f"group:{candidate.candidate_id}:background_right")
             else:
-                zone_id = "zone_overlay_global"
+                zone_id = _coerce_zone_id(
+                    "zone_overlay_global",
+                    zone_registry,
+                    log_context=f"group:{candidate.candidate_id}:background_fallback",
+                )
 
         group_id = f"group_{candidate.candidate_id}"
         candidate_group_map[candidate.candidate_id] = group_id
@@ -764,19 +825,31 @@ def merge_semantic_graph(
         source_figma_id = candidate.source_node_ids[0]
 
         zone_id = _guess_zone_id_from_position(candidate, layout_pattern)
-        if zone_id not in zone_ids:
-            zone_id = "zone_overlay_global"
+        zone_id = _coerce_zone_id(
+            zone_id,
+            zone_registry,
+            log_context=f"element:{candidate.candidate_id}:layout_guess",
+        )
         if element_role == ElementRole.AGE_BADGE:
-            zone_id = "zone_overlay_global"
+            zone_id = _coerce_zone_id(
+                "zone_overlay_global",
+                zone_registry,
+                log_context=f"element:{candidate.candidate_id}:age_badge",
+            )
         elif candidate.candidate_type == "image_like":
-            zone_id = "zone_image_right" if "zone_image_right" in zone_ids else "zone_overlay_global"
+            prefer = "zone_image_right" if "zone_image_right" in zone_registry else "zone_overlay_global"
+            zone_id = _coerce_zone_id(prefer, zone_registry, log_context=f"element:{candidate.candidate_id}:image_like")
         elif candidate.candidate_type == "background":
-            if candidate.center_x_norm < 0.5 and "zone_text_left" in zone_ids:
-                zone_id = "zone_text_left"
-            elif candidate.center_x_norm >= 0.5 and "zone_image_right" in zone_ids:
-                zone_id = "zone_image_right"
+            if candidate.center_x_norm < 0.5 and "zone_text_left" in zone_registry:
+                zone_id = _coerce_zone_id("zone_text_left", zone_registry, log_context=f"element:{candidate.candidate_id}:background_left")
+            elif candidate.center_x_norm >= 0.5 and "zone_image_right" in zone_registry:
+                zone_id = _coerce_zone_id("zone_image_right", zone_registry, log_context=f"element:{candidate.candidate_id}:background_right")
             else:
-                zone_id = "zone_overlay_global"
+                zone_id = _coerce_zone_id(
+                    "zone_overlay_global",
+                    zone_registry,
+                    log_context=f"element:{candidate.candidate_id}:background_fallback",
+                )
 
         adaptation_policy = _adaptation_policy_from_candidate_annotation(qwen_candidate_ann)
         if adaptation_policy.anchor_type == AnchorType.FREE:
@@ -837,7 +910,6 @@ def merge_semantic_graph(
         )
 
     group_map = {g.id: g for g in groups}
-    zone_map = {z.id for z in zones}
 
     for element in elements:
         if element.group_id in group_map:
@@ -846,16 +918,35 @@ def merge_semantic_graph(
     groups = [g for g in groups if g.children_elements or g.role in {GroupRole.HEADLINE_GROUP, GroupRole.LEGAL_GROUP, GroupRole.BRAND_GROUP}]
     group_map = {g.id: g for g in groups}
 
+    referenced_zone_ids = {g.zone_id for g in groups} | {e.zone_id for e in elements}
+    if referenced_zone_ids:
+        zones = [z for z in zones if z.id in referenced_zone_ids]
+    zone_registry = _zone_registry_ids(zones)
+
+    for gi, g in enumerate(groups):
+        if g.zone_id not in zone_registry:
+            fixed = _coerce_zone_id(g.zone_id, zone_registry, log_context=f"post_trim_group:{g.id}")
+            groups[gi] = g.model_copy(update={"zone_id": fixed})
+
+    for ei, el in enumerate(elements):
+        if el.zone_id not in zone_registry:
+            fixed = _coerce_zone_id(el.zone_id, zone_registry, log_context=f"post_trim_element:{el.id}")
+            elements[ei] = el.model_copy(update={"zone_id": fixed})
+
+    referenced_zone_ids = {g.zone_id for g in groups} | {e.zone_id for e in elements}
+    if referenced_zone_ids - _zone_registry_ids(zones):
+        _ensure_zone_default_registry(zones)
+        zones = [z for z in zones if z.id in referenced_zone_ids or z.id == ZONE_DEFAULT_ID]
+    zone_registry = _zone_registry_ids(zones)
+
     zone_children: dict[str, list[str]] = {}
     for group in groups:
-        if group.zone_id in zone_map:
+        if group.zone_id in zone_registry:
             zone_children.setdefault(group.zone_id, []).append(group.id)
 
     for zone in zones:
         zone.children_groups = zone_children.get(zone.id, [])
 
-    used_zone_ids = {g.zone_id for g in groups}
-    zones = [z for z in zones if z.id in used_zone_ids or z.role == ZoneRole.OVERLAY_ZONE]
     zone_map = {z.id: z for z in zones}
 
     for group in groups:
