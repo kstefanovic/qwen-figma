@@ -1,0 +1,12 @@
+{
+  "name": "Qwen Layout Converter",
+  "id": "qwen-layout-converter-plugin",
+  "api": "1.0.0",
+  "main": "code.js",
+  "ui": "ui.html",
+  "editorType": ["figma"],
+  "networkAccess": {
+    "allowedDomains": ["https://theye-inference.onrender.com"],
+    "devAllowedDomains": ["http://localhost:30079"]
+  }
+}
