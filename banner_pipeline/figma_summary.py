@@ -89,22 +89,30 @@ def build_figma_summary(
         text = (n.text or "").strip()
         if len(text) > max_text_len:
             text = text[: max_text_len - 1] + "…"
-        nodes_out.append(
-            {
-                "id": n.id,
-                "path": path,
-                "name": n.name,
-                "name_is_generic": not bool((n.name or "").strip()) or str(n.name).strip().lower().startswith(("group ", "frame ", "rectangle ", "vector ")),
-                "type": n.type,
-                "text": text,
-                "bbox_canvas": [n.x_norm, n.y_norm, n.w_norm, n.h_norm],
-                "font_size": _font_size_from_extra(ex),
-                "font_family": _font_family_from_extra(ex),
-                "parent_id": n.parent_id,
-                "children_ids": list(n.child_ids),
-                "visual_hints": _visual_hints_from_extra(ex),
+        row: dict[str, Any] = {
+            "id": n.id,
+            "path": path,
+            "name": n.name,
+            "name_is_generic": not bool((n.name or "").strip())
+            or str(n.name).strip().lower().startswith(("group ", "frame ", "rectangle ", "vector ")),
+            "type": n.type,
+            "text": text,
+            "bbox_canvas": [n.x_norm, n.y_norm, n.w_norm, n.h_norm],
+            "font_size": _font_size_from_extra(ex),
+            "font_family": _font_family_from_extra(ex),
+            "parent_id": n.parent_id,
+            "children_ids": list(n.child_ids),
+            "visual_hints": _visual_hints_from_extra(ex),
+        }
+        ar = ex.get("atlas_region")
+        if isinstance(ar, dict) and all(k in ar for k in ("x", "y", "width", "height")):
+            row["atlas_region"] = {
+                "x": ar.get("x"),
+                "y": ar.get("y"),
+                "width": ar.get("width"),
+                "height": ar.get("height"),
             }
-        )
+        nodes_out.append(row)
         for i, cid in enumerate(n.child_ids):
             if cid in node_by_id:
                 visit(cid, _child_path(path, i))

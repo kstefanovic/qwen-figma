@@ -1516,8 +1516,11 @@ Return JSON only (no markdown fences):
 
     def _build_scene_prompt(self, request: SceneAnnotateRequest) -> str:
         figma_summary = request.figma_summary or {}
-        node_refs = [
-            {
+        node_refs = []
+        for node in (figma_summary.get("nodes") or [])[:120]:
+            if not isinstance(node, dict):
+                continue
+            ref: dict[str, Any] = {
                 "id": node.get("id"),
                 "path": node.get("path"),
                 "name": node.get("name"),
@@ -1529,9 +1532,10 @@ Return JSON only (no markdown fences):
                 "children_ids": node.get("children_ids"),
                 "visual_hints": node.get("visual_hints"),
             }
-            for node in (figma_summary.get("nodes") or [])[:120]
-            if isinstance(node, dict)
-        ]
+            ar = node.get("atlas_region")
+            if isinstance(ar, dict):
+                ref["atlas_region"] = ar
+            node_refs.append(ref)
         candidate_refs = [
             {
                 "candidate_id": cand.get("candidate_id"),
@@ -1548,12 +1552,42 @@ Return JSON only (no markdown fences):
             for cand in (figma_summary.get("candidates") or [])[:80]
             if isinstance(cand, dict)
         ]
+        atlas_ps = (request.element_atlas_image_path or "").strip()
+        n_crops = len(request.element_image_paths or [])
+        n_after_banner = (1 if atlas_ps else 0) + n_crops
+        extra_image_rules = ""
+        if n_after_banner:
+            if atlas_ps and n_crops:
+                last_idx = 2 + n_crops
+                extra_image_rules = f"""
+Image inputs (order matters; same design):
+- Image 1: full banner (canonical layout on the frame canvas; normalized bbox in JSON).
+- Image 2: **element atlas** — one PNG packing rasterized leaf layers in rows with gaps between cells. Use it to see each leaf’s pixels at export resolution. In the compact node refs JSON, `atlas_region` on a node (when present) is {{x, y, width, height}} in **atlas pixel space** for that node’s `path`; align regions with image 2.
+- Images 3 through {last_idx}: optional **per-leaf crops** (same leaves, higher per-tile detail). Prefer correlating by `path` / `id` with the JSON and atlas.
+- Treat Figma `id`, `path`, and `bbox_canvas` as source of truth for geometry; do not invent ids from pixels alone.
+"""
+            elif atlas_ps:
+                extra_image_rules = """
+Image inputs (order matters; same design):
+- Image 1: full banner (canonical layout on the frame canvas; normalized bbox in JSON).
+- Image 2: **element atlas** — one PNG packing rasterized leaf layers in rows with gaps. In the compact node refs JSON, `atlas_region` (when present) is {x, y, width, height} in **atlas pixel space** for that node’s `path`; use it to read each leaf’s pixels in image 2.
+- Treat Figma `id`, `path`, and `bbox_canvas` as source of truth; use the atlas for visual detail and disambiguation.
+"""
+            else:
+                extra_image_rules = f"""
+Image inputs (order matters):
+- Image 1 is the full banner (canonical layout and composition).
+- Images 2 through {1 + n_crops} are PNG crops of individual layers or regions from the same design. Use them with image 1 for fine detail. Still treat the Figma JSON ids and geometry as source of truth; do not invent node ids from crops alone.
+"""
+
         return f"""
 You are a scene-level semantic correction engine for a Figma banner adaptation backend.
 
 Critical rules:
 - Analyze ONLY the current design. Do not copy names from previous examples.
 - Use the Figma-derived node tree and ids as source of truth.
+- **Never** assign `decoration_sparkle`, `decoration_star`, `decoration_glow`, or other `decoration_*` **element** names to: TEXT nodes, nodes with visible copy (`text` in JSON), headline/subheadline/legal clusters, brand or logo parts, age badges, or price lines. Those need roles like `headline`, `subheadline`, `legal_text`, `brand_name_*`, `logo`, `age_badge`, `price_group`, `star_straight` / `star_rotated` for actual star shapes. Reserve `decoration_sparkle` for small non-text sparkles only.
+- **Group** `semantic_name` for `headline_group` / `brand_group` / `legal_group` / `badge_group` must stay `headline_group`, `brand_group`, `legal_group`, `badge_group` (or similar)—not `decoration_sparkle`.
 - Do NOT invent candidate ids, figma ids, paths, or child ids.
 - Return ONE valid JSON object only. No markdown, no prose, no comments.
 - The response must start with `{{` and end with `}}`.
@@ -1561,16 +1595,18 @@ Critical rules:
 - Classify 0+, 3+, 6+, 12+, 16+, 18+ as age_badge, never as price_group.
 - Only use price_group when text clearly contains real pricing markers like ₽, $, €, руб, %, скид, от, numeric price formats.
 - If multiple nearby stars/sparkles belong to one decorative family, use one decoration_group.
+- For a decoration group candidate whose `grouping_reason` is `star_family_global` (or all `source_node_ids` are star shapes), every Figma `source_node_id` must appear exactly once in `updates` with a distinct `semantic_name` from the banner image: use `star_straight` or `star_rotated` for a single star. If two or more stars share the same orientation (all upright vs all tilted), use `star_straight_1`, `star_straight_2`, … or `star_rotated_1`, `star_rotated_2`, … Use mixed forms (`star_straight`, `star_rotated`) when orientations differ. Do not emit separate decoration groups per star; keep one `group_annotations` entry for that decoration candidate with `semantic_name` `decoration_group`.
 - Brand/logo naming must adapt to the current design: if the mark is not M-shaped, do not call it logo_m. Use logo_heart, logo_leaf, or logo_mark when appropriate.
 - For fragmented brand text like Я + ндекс or Ya + ndex, name parts adaptively using brand_name_yandex_part, brand_name_market_part, brand_name_lavka_part when needed.
 - Prefer short semantic names suitable for Figma layer names.
-
+{extra_image_rules}
 Allowed element semantic_name examples:
 headline, subheadline, legal_text, age_badge, price_group,
 brand_group, logo, logo_mark, logo_m, logo_heart, logo_leaf, logo_ellipse,
 brand_name_yandex, brand_name_market, brand_name_lavka,
 brand_name_yandex_part, brand_name_market_part, brand_name_lavka_part,
 decoration_group, decoration_star, decoration_sparkle, decoration_glow,
+star_straight, star_rotated, star_straight_1, star_straight_2, star_rotated_1, star_rotated_2,
 hero_group, hero_item, hero_person, product_item, product_food, product_drink,
 background_group, background_color, background_shape, background_gradient, visual_asset
 
@@ -1771,9 +1807,30 @@ Return this JSON shape only:
 
         prompt = self._build_scene_prompt(request)
         mtokens = max(512, min(768, int(self.max_new_tokens)))
-        images = [image] if image is not None else []
+        images: list[Image.Image] = [image] if image is not None else []
+        max_after_banner = 32
+        atlas_ps = (request.element_atlas_image_path or "").strip()
+        if atlas_ps:
+            try:
+                ai = self._load_image(atlas_ps)
+                ai = self._prepare_image_for_model(ai, "annotate_scene/element_atlas")
+                images.append(ai)
+                max_after_banner -= 1
+            except Exception as e:
+                logger.warning("annotate_scene: skip element_atlas_image_path=%r: %s", atlas_ps, e)
+        for i, p in enumerate((request.element_image_paths or [])[:max_after_banner]):
+            ps = str(p).strip()
+            if not ps:
+                continue
+            try:
+                ei = self._load_image(ps)
+                ei = self._prepare_image_for_model(ei, f"annotate_scene/element_crop_{i}")
+                images.append(ei)
+            except Exception as e:
+                logger.warning("annotate_scene: skip element_image_paths[%d]=%r: %s", i, ps, e)
         logger.info(
-            "annotate_scene calling model (single pass, max_new_tokens=%s temperature=%.2f do_sample=%s)",
+            "annotate_scene calling model (images=%d incl. banner, max_new_tokens=%s temperature=%.2f do_sample=%s)",
+            len(images),
             mtokens,
             self.temperature,
             self.temperature > 0,
@@ -1800,6 +1857,8 @@ Return this JSON shape only:
             heuristic_roles={},
             figma_summary=request.figma_summary,
             banner_image_path=request.banner_image_path,
+            element_image_paths=list(request.element_image_paths or []),
+            element_atlas_image_path=request.element_atlas_image_path,
         )
         return self.annotate_scene(scene_req)
 

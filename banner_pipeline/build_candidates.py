@@ -462,39 +462,25 @@ def _bundle_source_node_ids(candidates: list[SemanticCandidate]) -> set[str]:
 
 def _build_decoration_candidates(nodes: list[CollapsedNode], bundle: CandidateBundle) -> None:
     brand_node_ids = _bundle_source_node_ids(bundle.brand_candidates)
-    decoration_nodes: list[CollapsedNode] = []
+    star_nodes: list[CollapsedNode] = []
+    other_decoration_nodes: list[CollapsedNode] = []
     for node in nodes:
         if node.id in brand_node_ids:
             continue
         if _is_star_like(node):
-            decoration_nodes.append(node)
+            star_nodes.append(node)
             continue
         if _is_shape_like(node) and not _is_large_background_like(node) and node.area_ratio <= 0.06:
-            decoration_nodes.append(node)
+            other_decoration_nodes.append(node)
 
-    if not decoration_nodes:
+    if not star_nodes and not other_decoration_nodes:
         return
 
-    clusters: list[list[CollapsedNode]] = []
-    for node in sorted(decoration_nodes, key=lambda n: (n.y_norm, n.x_norm)):
-        matched_cluster: list[CollapsedNode] | None = None
-        node_is_star = _is_star_like(node)
-        for cluster in clusters:
-            seed = cluster[0]
-            same_family = _is_star_like(seed) == node_is_star
-            close_x = abs(node.center_x_norm - seed.center_x_norm) <= 0.18
-            close_y = abs(node.center_y_norm - seed.center_y_norm) <= 0.18
-            similar_area = 0.35 <= (min(node.area_ratio, seed.area_ratio) / max(node.area_ratio, seed.area_ratio, 1e-6)) <= 1.0
-            if same_family and close_x and close_y and similar_area:
-                matched_cluster = cluster
-                break
-        if matched_cluster is None:
-            clusters.append([node])
-        else:
-            matched_cluster.append(node)
+    decoration_idx = 0
 
-    for decoration_idx, cluster in enumerate(clusters, start=1):
-        grouping_reason = "star_family_cluster" if any(_is_star_like(n) for n in cluster) else "small_shape_cluster"
+    if star_nodes:
+        decoration_idx += 1
+        cluster = sorted(star_nodes, key=lambda n: (n.y_norm, n.x_norm))
         candidate = _candidate_from_nodes(
             candidate_id=f"decoration_{decoration_idx}",
             candidate_type="decoration",
@@ -503,7 +489,42 @@ def _build_decoration_candidates(nodes: list[CollapsedNode], bundle: CandidateBu
             group_hint="decoration_group",
             importance_hint="low",
             extra_data={
-                "grouping_reason": grouping_reason,
+                "grouping_reason": "star_family_global",
+                "member_count": len(cluster),
+            },
+        )
+        _add_candidate(bundle, candidate)
+
+    if not other_decoration_nodes:
+        return
+
+    clusters: list[list[CollapsedNode]] = []
+    for node in sorted(other_decoration_nodes, key=lambda n: (n.y_norm, n.x_norm)):
+        matched_cluster: list[CollapsedNode] | None = None
+        for cluster in clusters:
+            seed = cluster[0]
+            close_x = abs(node.center_x_norm - seed.center_x_norm) <= 0.18
+            close_y = abs(node.center_y_norm - seed.center_y_norm) <= 0.18
+            similar_area = 0.35 <= (min(node.area_ratio, seed.area_ratio) / max(node.area_ratio, seed.area_ratio, 1e-6)) <= 1.0
+            if close_x and close_y and similar_area:
+                matched_cluster = cluster
+                break
+        if matched_cluster is None:
+            clusters.append([node])
+        else:
+            matched_cluster.append(node)
+
+    for cluster in clusters:
+        decoration_idx += 1
+        candidate = _candidate_from_nodes(
+            candidate_id=f"decoration_{decoration_idx}",
+            candidate_type="decoration",
+            nodes=cluster,
+            role_hint="decoration",
+            group_hint="decoration_group",
+            importance_hint="low",
+            extra_data={
+                "grouping_reason": "small_shape_cluster",
                 "member_count": len(cluster),
             },
         )

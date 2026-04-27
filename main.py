@@ -5,7 +5,32 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
+
+MAX_ELEMENT_REFERENCE_PNGS = 32
+
+
+def _resolve_element_png_paths(paths: Sequence[str | Path] | None) -> list[str]:
+    """Absolute paths to existing PNG/JPEG/WebP crops for Qwen scene (same design as banner)."""
+    if not paths:
+        return []
+    out: list[str] = []
+    for p in paths[:MAX_ELEMENT_REFERENCE_PNGS]:
+        if p is None:
+            continue
+        sp = Path(p).expanduser().resolve()
+        if sp.is_file() and sp.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}:
+            out.append(str(sp))
+    return out
+
+
+def _resolve_atlas_png_path(atlas_image_path: str | Path | None) -> str | None:
+    if atlas_image_path is None:
+        return None
+    sp = Path(atlas_image_path).expanduser().resolve()
+    if sp.is_file() and sp.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}:
+        return str(sp)
+    return None
 
 from env_load import default_qwen_base_url, load_project_env
 
@@ -127,6 +152,8 @@ def run_pipeline(
     category: str | None = None,
     qwen_mode: str | None = "single_pass",
     pipeline_mode: str = "full_layout_debug",
+    element_image_paths: Sequence[str | Path] | None = None,
+    atlas_image_path: str | Path | None = None,
 ) -> dict[str, Any]:
     resolved_qwen_base = ((qwen_base_url or "").strip() or default_qwen_base_url()).rstrip("/")
     total_started = time.perf_counter()
@@ -202,6 +229,14 @@ def run_pipeline(
     groups_annotated = 0
     qwen_elapsed_seconds = 0.0
     qwen_request_metrics: list[dict[str, Any]] = []
+    scene_semantic_updates: list[dict[str, Any]] = []
+    resolved_atlas_path = _resolve_atlas_png_path(atlas_image_path)
+    resolved_element_paths = _resolve_element_png_paths(element_image_paths)
+    if resolved_atlas_path:
+        atlas_key = Path(resolved_atlas_path).resolve()
+        resolved_element_paths = [p for p in resolved_element_paths if Path(p).resolve() != atlas_key]
+    max_crops = MAX_ELEMENT_REFERENCE_PNGS - (1 if resolved_atlas_path else 0)
+    resolved_element_paths = resolved_element_paths[:max_crops]
 
     if effective_qwen_mode == "off":
         resolved_brand_family = brand_family if brand_family is not None else "generic"
@@ -230,6 +265,10 @@ def run_pipeline(
             candidate_bundle=candidate_bundle,
             heuristic_bundle=heuristic_bundle,
         )
+        if resolved_atlas_path:
+            scene_payload["element_atlas_image_path"] = resolved_atlas_path
+        if resolved_element_paths:
+            scene_payload["element_image_paths"] = list(resolved_element_paths)
         if save_intermediate_artifacts:
             td = time.perf_counter()
             save_json(scene_payload, intermediate_dir / "05a_scene_payload.json")
@@ -239,6 +278,7 @@ def run_pipeline(
             banner_image_path=str(banner_image_path),
             scene_payload=scene_payload,
         )
+        scene_semantic_updates = list(struct.semantic_updates or [])
         brand_context_annotation = struct.brand_context
         banner_annotation = struct.banner_annotation
         candidate_annotations = struct.candidate_annotations
@@ -424,6 +464,7 @@ def run_pipeline(
         banner_annotation=banner_annotation,
         qwen_candidate_annotations=candidate_annotations,
         qwen_group_annotations=group_annotations,
+        scene_semantic_updates=scene_semantic_updates,
         config=config,
     )
     stage_timings["merge"] = time.perf_counter() - t0
@@ -495,6 +536,8 @@ def run_pipeline(
         "nodes_annotated": len(semantic_graph.elements),
         "scene_semantic_updates": struct.semantic_updates if 'struct' in locals() else [],
         "scene_semantic_groups": struct.semantic_groups if 'struct' in locals() else [],
+        "element_image_paths_used": resolved_element_paths,
+        "atlas_image_path_used": resolved_atlas_path,
     }
 
 
@@ -535,6 +578,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional override for inferred category. Omit for automatic inference when --use-qwen.",
     )
+    parser.add_argument(
+        "--element-image",
+        type=str,
+        action="append",
+        default=None,
+        dest="element_images",
+        help="Optional path to an element/layer PNG (or jpg/webp) for Qwen scene; repeat flag for multiple (max %d)."
+        % MAX_ELEMENT_REFERENCE_PNGS,
+    )
+    parser.add_argument(
+        "--atlas-image",
+        type=str,
+        default=None,
+        dest="atlas_image",
+        help="Optional packed element atlas PNG for Qwen scene (image 2 after banner; per-leaf crops use remaining slots).",
+    )
     return parser
 
 
@@ -551,6 +610,8 @@ def main() -> None:
         language=args.language,
         category=args.category,
         qwen_mode=args.qwen_mode if args.use_qwen else "off",
+        element_image_paths=args.element_images,
+        atlas_image_path=args.atlas_image,
     )
 
 

@@ -491,6 +491,12 @@ class QwenAnnotator:
             "heuristic_roles": scene_payload.get("heuristic_roles") or {},
             "figma_summary": scene_payload.get("figma_summary") or {},
         }
+        extra_paths = scene_payload.get("element_image_paths") or []
+        if extra_paths:
+            payload["element_image_paths"] = [str(p) for p in extra_paths if str(p).strip()]
+        atlas_p = (scene_payload.get("element_atlas_image_path") or "").strip()
+        if atlas_p:
+            payload["element_atlas_image_path"] = atlas_p
         data = self._post("/annotate/scene", payload)
         return unpack_semantic_structure_response(data)
 

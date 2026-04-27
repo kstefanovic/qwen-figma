@@ -145,6 +145,92 @@ def _is_container_node(node_info: dict[str, Any] | None) -> bool:
     return str(node_info.get("type", "")).lower() in {"group", "frame", "component", "instance"}
 
 
+def _glow_export_label(
+    node_info: dict[str, Any] | None, *, root_width: float, root_height: float
+) -> tuple[str, str] | None:
+    """
+    Named glow / soft-edge blobs (e.g. glow_left) are background accents, not logos.
+    Returns (semantic_name, role) or None.
+    """
+    if not node_info or node_info.get("children_paths"):
+        return None
+    nm = str(node_info.get("name") or "").lower()
+    if "glow" not in nm and "glow" not in str(node_info.get("path") or "").lower():
+        return None
+    tl = str(node_info.get("type", "")).lower()
+    if tl not in {"ellipse", "vector", "rectangle"}:
+        return None
+    bounds = node_info.get("bounds") or {}
+    try:
+        x = float(bounds.get("x", 0.0))
+        w = float(bounds.get("width", 0.0))
+        cx = x + w * 0.5
+    except (TypeError, ValueError):
+        return None
+    if cx < 0.38 * root_width:
+        side = "left"
+    elif cx > 0.62 * root_width:
+        side = "right"
+    else:
+        side = "part"
+    return (f"background_glow_{side}", "background_shape")
+
+
+def _infer_container_export_from_children(
+    node_info: dict[str, Any],
+    by_path: dict[str, dict[str, Any]],
+) -> tuple[str, str] | None:
+    """
+    Map a mis-decorated frame/group to headline_group, brand_group, or decoration_group
+    from raw Figma children (text vs shapes only).
+    """
+    paths = node_info.get("children_paths") or []
+    children: list[dict[str, Any]] = []
+    for p in paths:
+        c = by_path.get(p)
+        if isinstance(c, dict):
+            children.append(c)
+    if not children:
+        return None
+
+    texts = [
+        c
+        for c in children
+        if (str(c.get("text") or "").strip()) or str(c.get("type", "")).lower() == "text"
+    ]
+    blob = " ".join(str(c.get("text") or "").strip() for c in texts).lower()
+
+    brand_name_hit = any(
+        k in blob
+        for k in (
+            "яндекс",
+            "yandex",
+            "лавка",
+            "lavka",
+            "маркет",
+            "market",
+        )
+    )
+    brand_child_hit = any(
+        any(
+            t in str(c.get("name") or "").lower()
+            for t in ("logo", "brand", "яндекс", "yandex", "лавка", "lavka", "маркет", "market")
+        )
+        for c in children
+    )
+
+    if texts:
+        if brand_name_hit or brand_child_hit:
+            return ("brand_group", "brand_group")
+        return ("headline_group", "headline_group")
+
+    shapeish = {"vector", "star", "ellipse", "rectangle", "boolean_operation", "line"}
+    if all(str(c.get("type", "")).lower() in shapeish for c in children):
+        return ("decoration_group", "decoration_group")
+
+    return None
+
+
 def _looks_like_background_glow(node_info: dict[str, Any] | None, *, root_width: float, root_height: float) -> bool:
     if not node_info or node_info.get("children_paths") or not node_info.get("visible", True):
         return False
@@ -276,6 +362,169 @@ def _is_generic_figma_name(name: str | None) -> bool:
 def _is_generic_semantic_name(name: str | None) -> bool:
     raw = (name or "").strip().lower()
     return raw in {"", "unknown", "node", "text", "group", "visual_asset", "brand_text"}
+
+
+def _is_decoration_semantic_label(name: str | None) -> bool:
+    """Qwen often over-uses decoration_sparkle; treat these as decoration-only labels."""
+    n = (name or "").strip().lower()
+    if not n.startswith("decoration_"):
+        return False
+    if n in {"decoration_group"}:
+        return False
+    return True
+
+
+def _coerce_scene_element_semantic_name(
+    role: str,
+    scene_sn: str | None,
+    baseline: str,
+    node_info: dict[str, Any] | None,
+) -> str:
+    """
+    If the VLM assigned a decoration_* name to a headline/brand/legal/badge node, drop the
+    override and keep the merge-graph / heuristic baseline.
+    """
+    s = (scene_sn or "").strip()
+    if not s:
+        return baseline
+    r = (role or "").lower()
+    if r in {"decoration", "decoration_group"} or r.startswith("decoration"):
+        return s
+    if _is_decoration_semantic_label(s):
+        return baseline
+    ni = node_info or {}
+    if (ni.get("text") or "").strip() and s.startswith("decoration_"):
+        return baseline
+    if str(ni.get("type", "")).lower() == "text" and s.startswith("decoration_"):
+        return baseline
+    return s
+
+
+def _coerce_scene_group_semantic_name(group_role: str, ann_sn: str | None) -> str:
+    s = (ann_sn or "").strip()
+    gr = (group_role or "").lower()
+    if gr != "decoration_group" and _is_decoration_semantic_label(s):
+        return ""
+    return s
+
+
+def _is_member_style_decoration_group_name(name: str | None) -> bool:
+    """VLM often puts per-element names (sparkle/star) on whole groups."""
+    sl = (name or "").strip().lower()
+    if not sl:
+        return False
+    if sl in {"decoration_sparkle", "decoration_star", "decoration_glow"}:
+        return True
+    return sl.startswith("decoration_sparkle_") or sl.startswith("decoration_star_")
+
+
+def _finalize_group_export_semantic_name(group_role: str, semantic_name: str | None) -> str:
+    """Never export a frame/group layer as decoration_sparkle — use *_group defaults."""
+    s = (semantic_name or "").strip()
+    if _is_member_style_decoration_group_name(s):
+        return _default_group_semantic_name(group_role)
+    gr = (group_role or "").lower()
+    if _is_decoration_semantic_label(s) and gr != "decoration_group":
+        return _default_group_semantic_name(group_role)
+    return s or _default_group_semantic_name(group_role)
+
+
+def _finalize_layer_export_labels(
+    semantic_name: str | None,
+    role: str | None,
+    node_info: dict[str, Any] | None,
+    *,
+    by_path: dict[str, Any] | None = None,
+    root_width: float = 1920.0,
+    root_height: float = 1080.0,
+) -> tuple[str, str]:
+    """
+    Last-pass repair for Figma renames: merge graph + VLM often label text/frames as
+    decoration_sparkle or visual_asset. Use raw_json text/type/children to recover
+    headline_group, brand_group, decoration_group, background glows, and stars.
+    """
+    ni = node_info or {}
+    name = (semantic_name or "").strip()
+    r = (role or "unknown").lower()
+    tl = str(ni.get("type", "")).lower()
+    txt = (ni.get("text") or "").strip()
+    n_low = name.lower()
+    mis_dec = _is_decoration_semantic_label(name)
+    loose_visual = n_low in {"visual_asset", "visual_group", ""}
+    childless = not ni.get("children_paths")
+    nm = str(ni.get("name") or "").lower()
+    leaf_shapes = {"rectangle", "ellipse", "vector", "boolean_operation", "line", "star"}
+    wrong_shape_name = mis_dec or loose_visual or n_low == "logo_mark"
+
+    def _glow_side_from_bounds() -> str:
+        try:
+            bb = ni.get("bounds") or {}
+            cx = float(bb.get("x", 0.0)) + float(bb.get("width", 0.0)) * 0.5
+            if cx < 0.38 * root_width:
+                return "left"
+            if cx > 0.62 * root_width:
+                return "right"
+        except (TypeError, ValueError):
+            pass
+        return "part"
+
+    # Leaf glow blobs (Figma name e.g. glow_left) mislabeled logo_mark / visual_asset / decoration_*
+    if tl in leaf_shapes and childless:
+        glow = _glow_export_label(ni, root_width=root_width, root_height=root_height)
+        if glow:
+            return glow
+        if _looks_like_background_glow(ni, root_width=root_width, root_height=root_height):
+            return (f"background_glow_{_glow_side_from_bounds()}", "background_shape")
+        if tl == "star" or ("star" in nm and wrong_shape_name):
+            return ("decoration_star", "decoration")
+        if mis_dec:
+            bb = ni.get("bounds") or {}
+            try:
+                mw = max(float(bb.get("width", 0) or 0), float(bb.get("height", 0) or 0))
+            except (TypeError, ValueError):
+                mw = 0.0
+            if mw < 100.0 and tl == "vector" and ("star" in nm or "spark" in nm):
+                return ("decoration_star", "decoration")
+            if mw >= 160.0:
+                return ("logo_mark", "brand_mark")
+            return ("decoration_sparkle", "decoration")
+
+    # Text mislabeled as decoration_* or visual_asset
+    if (mis_dec or loose_visual) and (txt or tl == "text"):
+        st = _semantic_name_from_text(ni.get("text"))
+        if st:
+            if st == "age_badge":
+                return (st, "age_badge")
+            if st == "price_group":
+                return (st, "price_main")
+            if st.startswith("brand_name"):
+                return (st, "brand_text")
+            return (st, "headline")
+        if _matches_age_badge(ni.get("text")):
+            return ("age_badge", "age_badge")
+        if _looks_like_price_text(ni.get("text")):
+            return ("price_group", "price_main")
+        if len(txt) > 96:
+            return ("legal_text", "legal")
+        return ("headline", "headline")
+
+    # Frames/groups: infer headline_group / brand_group / decoration_group from children
+    if tl in {"group", "frame", "component", "instance"}:
+        if by_path and (mis_dec or loose_visual):
+            inferred = _infer_container_export_from_children(ni, by_path)
+            if inferred:
+                return inferred
+        if mis_dec:
+            if r.endswith("_group"):
+                return (_default_group_semantic_name(r), r)
+            return ("decoration_group", "decoration_group")
+        if loose_visual and r.endswith("_group"):
+            return (_default_group_semantic_name(r), r)
+
+    if not mis_dec:
+        return (name or "visual_asset", r)
+
+    return ("visual_asset", r if r != "unknown" else "decoration")
 
 
 def _default_semantic_name(role: str, node_info: dict[str, Any] | None = None) -> str:
@@ -675,15 +924,40 @@ def _infer_decoration_children(
     children = [by_path[p] for p in group_node.get("children_paths", []) if p in by_path]
     out: list[dict[str, Any]] = []
     for child in children:
-        semantic_name = "decoration_star" if child.get("type") == "star" else "decoration_sparkle"
+        ct = str(child.get("type", "")).lower()
+        txt = (child.get("text") or "").strip()
+        if txt or ct == "text":
+            st = _semantic_name_from_text(child.get("text"))
+            if st:
+                role, semantic_name = (
+                    ("age_badge", "age_badge")
+                    if st == "age_badge"
+                    else ("price_main", "price_group")
+                    if st == "price_group"
+                    else ("brand_text", st)
+                    if st.startswith("brand_name")
+                    else ("headline", st)
+                )
+            elif _matches_age_badge(child.get("text")):
+                role, semantic_name = "age_badge", "age_badge"
+            elif _looks_like_price_text(child.get("text")):
+                role, semantic_name = "price_main", "price_group"
+            elif len(txt) > 96:
+                role, semantic_name = "legal", "legal_text"
+            else:
+                role, semantic_name = "headline", "headline"
+        elif ct == "star":
+            role, semantic_name = "decoration", "decoration_star"
+        else:
+            role, semantic_name = "decoration", "decoration_sparkle"
         out.append(
             _make_update_from_node(
                 child,
-                role="decoration",
+                role=role,
                 semantic_name=semantic_name,
                 parent_semantic_name=parent_semantic_name,
                 confidence=0.7,
-                reason="Small repeated decorative shape grouped into one decoration family.",
+                reason="Child under decoration_group: split text vs vector vs star from raw node.",
                 target_width=target_width,
                 target_height=target_height,
                 root_width=root_width,
@@ -718,8 +992,33 @@ def _infer_leaf_group_update(
             role = "badge"
             semantic_name = "badge"
     elif group_role == "decoration_group":
-        role = "decoration"
-        semantic_name = "decoration_star" if node_info.get("type") == "star" else "decoration_sparkle"
+        tl = str(node_info.get("type", "")).lower()
+        txt = (node_info.get("text") or "").strip()
+        if txt or tl == "text":
+            st = _semantic_name_from_text(node_info.get("text"))
+            if st:
+                role = (
+                    "age_badge"
+                    if st == "age_badge"
+                    else "price_main"
+                    if st == "price_group"
+                    else "brand_text"
+                    if st.startswith("brand_name")
+                    else "headline"
+                )
+                semantic_name = st
+            elif _matches_age_badge(node_info.get("text")):
+                role, semantic_name = "age_badge", "age_badge"
+            elif _looks_like_price_text(node_info.get("text")):
+                role, semantic_name = "price_main", "price_group"
+            elif len(txt) > 96:
+                role, semantic_name = "legal", "legal_text"
+            else:
+                role, semantic_name = "headline", "headline"
+        elif tl == "star":
+            role, semantic_name = "decoration", "decoration_star"
+        else:
+            role, semantic_name = "decoration", "decoration_sparkle"
     elif group_role in {"hero_group", "product_group"}:
         role = "hero_photo"
         semantic_name = "hero_image"
@@ -894,13 +1193,17 @@ def build_convert_semantic_payload(
             path_val = node_info["path"] if node_info is not None else None
             name_val = node_info.get("name") if node_info is not None else None
             scene_override = scene_updates_by_key.get((figma_id, path_val)) or scene_updates_by_key.get((figma_id, None)) or {}
+            scene_sn_raw = str(scene_override.get("semantic_name", "") or "").strip()
+            semantic_resolved = _coerce_scene_element_semantic_name(
+                role, scene_sn_raw, semantic_name, node_info
+            )
             bx, by, bw, bh = _bbox_canvas_scale(el)
             update = {
                 "source_figma_id": figma_id,
                 "path": path_val,
                 "name": name_val,
                 "role": str(scene_override.get("role", "") or role).lower(),
-                "semantic_name": str(scene_override.get("semantic_name", "") or semantic_name),
+                "semantic_name": semantic_resolved,
                 "parent_semantic_name": str(scene_override.get("parent_semantic_name", "") or candidate_ann.get("parent_semantic_name", "") or ""),
                 "confidence": float(scene_override.get("confidence", candidate_ann.get("confidence", confidence_by_element_id.get(element_id, 0.0))) or 0.0),
                 "reason": str(scene_override.get("reason", "") or candidate_ann.get("reason_short", "") or reason_by_element_id.get(element_id, "") or _semantic_reason(role, semantic_name)),
@@ -911,6 +1214,16 @@ def build_convert_semantic_payload(
                     "height": round(bh * th, 2),
                 },
             }
+            fin_sn, fin_r = _finalize_layer_export_labels(
+                update["semantic_name"],
+                update["role"],
+                node_info,
+                by_path=by_path,
+                root_width=root_width,
+                root_height=root_height,
+            )
+            update["semantic_name"] = fin_sn
+            update["role"] = fin_r
             merged_updates[(figma_id, path_val)] = update
             semantic_elements[figma_id] = {
                 "id": element_id,
@@ -939,7 +1252,11 @@ def build_convert_semantic_payload(
             parent_semantic_name = group_semantic_name_by_id.get(parent_group_id)
             if group_role == "background_group" and _looks_like_overflow_hero_image(group_node, root_width=root_width, root_height=root_height):
                 group_role = "hero_group"
-            group_semantic_name = str(group_ann.get("semantic_name", "") or "").strip() or _default_group_semantic_name(group_role)
+            ann_group_sn = _coerce_scene_group_semantic_name(
+                group_role, str(group_ann.get("semantic_name", "") or "").strip()
+            )
+            group_semantic_name = ann_group_sn or _default_group_semantic_name(group_role)
+            group_semantic_name = _finalize_group_export_semantic_name(group_role, group_semantic_name)
             group_confidence = float(group_ann.get("confidence", 0.72) or 0.72)
             group_reason = str(group_ann.get("reason_short", "") or f"Grouped as {group_semantic_name} from graph role and raw Figma hierarchy.")
             group_semantic_name_by_id[group_id] = group_semantic_name
@@ -1036,14 +1353,32 @@ def build_convert_semantic_payload(
 
                 for child in inferred_children:
                     scene_override = scene_updates_by_key.get((child["source_figma_id"], child["path"])) or {}
+                    ch_node = by_id.get(child["source_figma_id"])
+                    ch_role = str(scene_override.get("role", "") or child["role"]).lower()
+                    ch_sn = _coerce_scene_element_semantic_name(
+                        ch_role,
+                        str(scene_override.get("semantic_name", "") or ""),
+                        str(child["semantic_name"]),
+                        ch_node,
+                    )
                     child_update = {
                         **child,
-                        "role": str(scene_override.get("role", "") or child["role"]).lower(),
-                        "semantic_name": str(scene_override.get("semantic_name", "") or child["semantic_name"]),
+                        "role": ch_role,
+                        "semantic_name": ch_sn,
                         "parent_semantic_name": str(scene_override.get("parent_semantic_name", "") or child.get("parent_semantic_name", "") or ""),
                         "confidence": float(scene_override.get("confidence", child.get("confidence", 0.0)) or 0.0),
                         "reason": str(scene_override.get("reason", "") or child.get("reason", "")),
                     }
+                    cfs, cfr = _finalize_layer_export_labels(
+                        child_update["semantic_name"],
+                        child_update["role"],
+                        ch_node,
+                        by_path=by_path,
+                        root_width=root_width,
+                        root_height=root_height,
+                    )
+                    child_update["semantic_name"] = cfs
+                    child_update["role"] = cfr
                     merged_updates[(child["source_figma_id"], child["path"])] = child_update
                     figma_id = child["source_figma_id"]
                     semantic_elements[figma_id] = {
@@ -1067,6 +1402,40 @@ def build_convert_semantic_payload(
                     parent_semantic_name=group_semantic_name,
                 )
                 if leaf_update is not None:
+                    scene_ov = scene_updates_by_key.get(
+                        (leaf_update["source_figma_id"], leaf_update["path"])
+                    ) or {}
+                    leaf_node = by_id.get(leaf_update["source_figma_id"])
+                    lr = str(scene_ov.get("role", "") or leaf_update["role"]).lower()
+                    lsn = _coerce_scene_element_semantic_name(
+                        lr,
+                        str(scene_ov.get("semantic_name", "") or ""),
+                        str(leaf_update["semantic_name"]),
+                        leaf_node,
+                    )
+                    lpar = str(scene_ov.get("parent_semantic_name", "") or "").strip() or leaf_update.get(
+                        "parent_semantic_name"
+                    )
+                    leaf_update = {
+                        **leaf_update,
+                        "role": lr,
+                        "semantic_name": lsn,
+                        "parent_semantic_name": lpar,
+                        "confidence": float(
+                            scene_ov.get("confidence", leaf_update.get("confidence", 0.0)) or 0.0
+                        ),
+                        "reason": str(scene_ov.get("reason", "") or leaf_update.get("reason", "")),
+                    }
+                    lfn, lfr = _finalize_layer_export_labels(
+                        leaf_update["semantic_name"],
+                        leaf_update["role"],
+                        leaf_node,
+                        by_path=by_path,
+                        root_width=root_width,
+                        root_height=root_height,
+                    )
+                    leaf_update["semantic_name"] = lfn
+                    leaf_update["role"] = lfr
                     merged_updates[(leaf_update["source_figma_id"], leaf_update["path"])] = leaf_update
                     semantic_elements[leaf_update["source_figma_id"]] = {
                         "id": f"figma_{_safe_slug(leaf_update['source_figma_id'])}",

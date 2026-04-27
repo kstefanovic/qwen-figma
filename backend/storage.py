@@ -79,8 +79,9 @@ class RunStorage:
         content: bytes,
     ) -> str:
         target_path = self.get_input_dir(run_id) / filename
+        target_path.parent.mkdir(parents=True, exist_ok=True)
         target_path.write_bytes(content)
-        return str(target_path)
+        return str(target_path.resolve())
 
     def read_meta(self, run_id: str) -> dict[str, Any]:
         meta_path = self.get_meta_path(run_id)

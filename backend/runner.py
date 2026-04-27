@@ -20,6 +20,8 @@ class PipelineRunner:
         run_id: str,
         raw_json_path: str | Path,
         banner_image_path: str | Path,
+        element_image_paths: list[str] | None = None,
+        atlas_image_path: str | None = None,
         brand_family: str | None = None,
         language: str | None = None,
         category: str | None = None,
@@ -57,6 +59,8 @@ class PipelineRunner:
                 category=category,
                 qwen_mode=qwen_mode if use_qwen else "off",
                 pipeline_mode=pipeline_mode,
+                element_image_paths=element_image_paths,
+                atlas_image_path=atlas_image_path,
             )
 
             semantic_graph_path = self.storage.get_final_dir(run_id) / "semantic_graph.json"

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -693,6 +693,65 @@ def _dedupe_visual_candidates(candidates: list[SemanticCandidate], config: Merge
     return kept
 
 
+def _scene_semantic_allowed_for_element_role(role: ElementRole, semantic_name: str) -> bool:
+    """Reject decoration_* VLM labels on headline/brand/legal/etc. elements."""
+    s = (semantic_name or "").strip()
+    if not s:
+        return False
+    sl = s.lower()
+    if sl.startswith("decoration_") and sl != "decoration_group" and role != ElementRole.DECORATION:
+        return False
+    return True
+
+
+def _index_scene_updates_by_source(updates: list[dict[str, Any]] | None) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    if not updates:
+        return out
+    for item in updates:
+        if not isinstance(item, dict):
+            continue
+        sid = str(item.get("source_figma_id", "") or "").strip()
+        if sid:
+            out[sid] = item
+    return out
+
+
+def _safe_element_id_suffix(source_figma_id: str) -> str:
+    return source_figma_id.replace(":", "_").replace("/", "_")
+
+
+def _fallback_decoration_member_semantic_name(
+    node: CollapsedNode,
+    *,
+    ordinal: int,
+    total: int,
+) -> str:
+    """When the VLM omits per-member names inside a decoration cluster, infer from geometry/text."""
+    txt = (node.text or "").strip() if node.text else ""
+    if txt:
+        tl = txt.lower()
+        if any(x in tl for x in ("+", "18+", "16+", "12+", "0+", "6+", "3+")):
+            return "age_badge"
+        if any(x in tl for x in ("₽", "$", "€", "%", "руб", "скид", "от ")):
+            return "price_group"
+        if len(txt) > 72:
+            return "legal_text"
+        return "headline" if ordinal <= 1 else "subheadline"
+    tl = (node.type or "").lower()
+    if tl == "star":
+        if total <= 1:
+            return "decoration_star"
+        return f"decoration_star_{ordinal}"
+    if tl == "text":
+        return "headline" if ordinal <= 1 else "subheadline"
+    if tl in {"rectangle", "ellipse", "vector"} and (node.w_norm or 0) > 0.08 and (node.h_norm or 0) > 0.04:
+        return "logo_mark" if ordinal <= 2 else "visual_asset"
+    if total <= 1:
+        return "decoration_sparkle"
+    return f"decoration_sparkle_{ordinal}"
+
+
 def _dedupe_constraints(constraints: list[Constraint]) -> list[Constraint]:
     deduped: list[Constraint] = []
     seen: set[tuple[str, str, str]] = set()
@@ -717,9 +776,12 @@ def merge_semantic_graph(
     banner_annotation: Optional[BannerAnnotation] = None,
     qwen_candidate_annotations: Optional[dict[str, CandidateAnnotation]] = None,
     qwen_group_annotations: Optional[dict[str, GroupAnnotation]] = None,
+    scene_semantic_updates: Optional[list[dict[str, Any]]] = None,
     config: Optional[MergeConfig] = None,
 ) -> SemanticGraph:
     config = config or MergeConfig()
+    collapsed_by_id: dict[str, CollapsedNode] = {n.id: n for n in collapsed_nodes}
+    update_by_source = _index_scene_updates_by_source(scene_semantic_updates)
 
     layout_pattern = _safe_layout_pattern(banner_annotation.layout_pattern if banner_annotation else None)
     zones = _zones_from_banner_annotation(banner_annotation, layout_pattern)
@@ -839,8 +901,6 @@ def merge_semantic_graph(
         if element_role == ElementRole.UNKNOWN and not config.keep_unknown_candidates:
             continue
 
-        source_figma_id = candidate.source_node_ids[0]
-
         zone_id = _guess_zone_id_from_position(candidate, layout_pattern)
         zone_id = _coerce_zone_id(
             zone_id,
@@ -904,6 +964,63 @@ def merge_semantic_graph(
         else:
             is_text = candidate.text_count > 0
 
+        if candidate.candidate_type == "decoration" and len(candidate.source_node_ids) > 1:
+            ordered = sorted(
+                list(candidate.source_node_ids),
+                key=lambda nid: (
+                    collapsed_by_id[nid].y_norm if nid in collapsed_by_id else 0.0,
+                    collapsed_by_id[nid].x_norm if nid in collapsed_by_id else 0.0,
+                ),
+            )
+            total_m = len(ordered)
+            for ord_i, sid in enumerate(ordered, start=1):
+                sub = collapsed_by_id.get(sid)
+                if sub is None:
+                    continue
+                up = update_by_source.get(sid) or {}
+                raw_name = str(up.get("semantic_name", "") or "").strip()
+                if raw_name.startswith("decoration_") and ((sub.text or "").strip() or sub.type.lower() == "text"):
+                    raw_name = ""
+                sem_name = raw_name or _fallback_decoration_member_semantic_name(sub, ordinal=ord_i, total=total_m)
+                bw = max(float(sub.w_norm), 1e-4)
+                bh = max(float(sub.h_norm), 1e-4)
+                bbox = BBox(x=float(sub.x_norm), y=float(sub.y_norm), w=bw, h=bh)
+                center = [float(sub.x_norm) + bw / 2.0, float(sub.y_norm) + bh / 2.0]
+                elements.append(
+                    Element(
+                        id=f"el_{candidate.candidate_id}_{_safe_element_id_suffix(sid)}",
+                        source_figma_id=sid,
+                        type=candidate.candidate_type,
+                        role=element_role,
+                        group_id=group_id,
+                        zone_id=zone_id,
+                        semantic_name=sem_name,
+                        bbox_canvas=bbox,
+                        center_canvas=center,
+                        visible=True,
+                        functional_type=functional_type,
+                        importance_level=_resolve_importance(heuristic_ann, qwen_candidate_ann, qwen_group_ann, config),
+                        is_text=is_text,
+                        is_brand_related=is_brand_related or (qwen_candidate_ann.is_brand_related if qwen_candidate_ann else False),
+                        is_required_for_compliance=is_required_for_compliance or (qwen_candidate_ann.is_required_for_compliance if qwen_candidate_ann else False),
+                        text_content=text_content,
+                        text_features=_text_features_from_candidate(candidate),
+                        adaptation_policy=adaptation_policy,
+                    )
+                )
+            continue
+
+        source_figma_id = candidate.source_node_ids[0]
+        up0 = update_by_source.get(source_figma_id) or {}
+        sem0 = str(up0.get("semantic_name", "") or "").strip()
+        if not _scene_semantic_allowed_for_element_role(element_role, sem0):
+            sem0 = ""
+        if not sem0 and qwen_candidate_ann is not None:
+            q0 = str(qwen_candidate_ann.semantic_name or "").strip()
+            if _scene_semantic_allowed_for_element_role(element_role, q0):
+                sem0 = q0
+        semantic_name_single = sem0 or None
+
         elements.append(
             Element(
                 id=f"el_{candidate.candidate_id}",
@@ -912,6 +1029,7 @@ def merge_semantic_graph(
                 role=element_role,
                 group_id=group_id,
                 zone_id=zone_id,
+                semantic_name=semantic_name_single,
                 bbox_canvas=_bbox_from_candidate(candidate),
                 center_canvas=_center_from_candidate(candidate),
                 visible=True,

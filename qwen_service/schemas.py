@@ -36,6 +36,11 @@ class SemanticStructureAnnotateRequest(BaseModel):
 
     banner_image_path: str
     figma_summary: dict[str, Any]
+    element_image_paths: list[str] = Field(default_factory=list)
+    element_atlas_image_path: Optional[str] = Field(
+        default=None,
+        description="Optional packed leaf atlas PNG; model sees it as image 2 after the banner.",
+    )
 
 
 class SceneAnnotateRequest(BaseModel):
@@ -50,6 +55,14 @@ class SceneAnnotateRequest(BaseModel):
     heuristic_roles: dict[str, Any] = Field(default_factory=dict)
     figma_summary: Optional[dict[str, Any]] = None
     banner_image_path: Optional[str] = None
+    element_image_paths: list[str] = Field(
+        default_factory=list,
+        description="Absolute paths to per-leaf PNG crops (same design); after banner and optional atlas.",
+    )
+    element_atlas_image_path: Optional[str] = Field(
+        default=None,
+        description="Packed element atlas PNG path; when set, loaded as image 2 (after banner, before crops).",
+    )
 
 
 class HealthResponse(BaseModel):

@@ -164,6 +164,7 @@ class Element(BaseModel):
     role: ElementRole
     group_id: str
     zone_id: str
+    semantic_name: Optional[str] = None
     bbox_canvas: BBox
     bbox_group: Optional[BBox] = None
     center_canvas: Optional[List[float]] = None
