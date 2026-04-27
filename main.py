@@ -7,6 +7,10 @@ import time
 from pathlib import Path
 from typing import Any
 
+from env_load import default_qwen_base_url, load_project_env
+
+load_project_env()
+
 from banner_pipeline.build_candidates import CandidateBundle, build_candidates
 from banner_pipeline.collapse_groups import collapse_wrapper_groups
 from banner_pipeline.figma_summary import build_figma_summary, build_qwen_scene_payload
@@ -117,13 +121,14 @@ def run_pipeline(
     banner_image_path: str | Path,
     output_dir: str | Path,
     use_qwen: bool = False,
-    qwen_base_url: str = "http://127.0.0.1:8001",
+    qwen_base_url: str | None = None,
     brand_family: str | None = None,
     language: str | None = None,
     category: str | None = None,
     qwen_mode: str | None = "single_pass",
     pipeline_mode: str = "full_layout_debug",
 ) -> dict[str, Any]:
+    resolved_qwen_base = ((qwen_base_url or "").strip() or default_qwen_base_url()).rstrip("/")
     total_started = time.perf_counter()
     output_dir = ensure_dir(output_dir)
     intermediate_dir = ensure_dir(output_dir / "intermediate")
@@ -204,7 +209,7 @@ def run_pipeline(
         resolved_category = category if category is not None else "unknown"
     elif effective_qwen_mode in {"single_pass", "scene_only"} and use_qwen_scene_only:
         t0 = time.perf_counter()
-        annotator = QwenAnnotator(base_url=qwen_base_url)
+        annotator = QwenAnnotator(base_url=resolved_qwen_base)
         annotator.load_model()
 
         figma_summary = build_figma_summary(
@@ -273,7 +278,7 @@ def run_pipeline(
     elif effective_qwen_mode == "single_pass":
         # fallback when USE_QWEN_SCENE_ONLY is disabled
         t0 = time.perf_counter()
-        annotator = QwenAnnotator(base_url=qwen_base_url)
+        annotator = QwenAnnotator(base_url=resolved_qwen_base)
         annotator.load_model()
 
         brand_context_annotation = annotator.annotate_brand_context(
@@ -333,7 +338,7 @@ def run_pipeline(
     else:
         # per_candidate legacy: brand + banner + each candidate + group-like candidates
         t0 = time.perf_counter()
-        annotator = QwenAnnotator(base_url=qwen_base_url)
+        annotator = QwenAnnotator(base_url=resolved_qwen_base)
         annotator.load_model()
 
         brand_context_annotation = annotator.annotate_brand_context(
@@ -506,7 +511,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=["single_pass", "scene_only", "per_candidate", "off"],
         help="Qwen VLM strategy (default single_pass). Ignored unless --use-qwen.",
     )
-    parser.add_argument("--qwen-base-url", type=str, default="http://127.0.0.1:8001", help="Base URL of the running Qwen service")
+    parser.add_argument(
+        "--qwen-base-url",
+        type=str,
+        default=default_qwen_base_url(),
+        help="Base URL of the running Qwen service (default: QWEN_BASE_URL from env or http://127.0.0.1:30078)",
+    )
     parser.add_argument(
         "--brand-family",
         type=str,

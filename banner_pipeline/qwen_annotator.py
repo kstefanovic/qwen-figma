@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+
+from env_load import default_qwen_base_url
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -281,10 +283,10 @@ class QwenAnnotator:
 
     def __init__(
         self,
-        base_url: str = "http://127.0.0.1:8001",
+        base_url: str | None = None,
         timeout_seconds: int = 300,
     ) -> None:
-        self.base_url = base_url.rstrip("/")
+        self.base_url = ((base_url or "").strip() or default_qwen_base_url()).rstrip("/")
         self.timeout_seconds = timeout_seconds
         self.request_metrics: list[QwenRequestMetric] = []
 

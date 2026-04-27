@@ -1,7 +1,9 @@
 fastapi
 uvicorn
+python-dotenv
 pillow
 sentencepiece
 einops
 requests
 pydantic
+python-multipart

@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from env_load import default_qwen_base_url, load_project_env
+
+load_project_env()
+
 import base64
 import binascii
 import json
@@ -34,7 +38,7 @@ from backend.storage import RunStorage
 
 
 RUNS_DIR = Path("runs")
-QWEN_BASE_URL = "http://127.0.0.1:10196"
+QWEN_BASE_URL = default_qwen_base_url()
 
 
 def _optional_form_str(value: Optional[str]) -> Optional[str]:

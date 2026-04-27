@@ -1,44 +1,39 @@
+const path = require("path");
+
+const root = __dirname;
+const py = path.join(root, ".venv", "bin", "python");
+
 module.exports = {
   apps: [
     {
       name: "qwen-figma-backend",
-      cwd: "/root/figma/qwen-figma",
-      script: "/root/figma/qwen-figma/.venv/bin/uvicorn",
-      args: "backend.app:app --host 0.0.0.0 --port 10197",
+      cwd: root,
+      script: py,
+      args: "run_backend.py",
       interpreter: "none",
       env: {
-        QWEN_BASE_URL: "http://127.0.0.1:10196",
-        USE_QWEN_SCENE_ONLY: "true",
-        DEBUG_SAVE_ARTIFACTS: "true",
-        PYTHONUNBUFFERED: "1"
+        PYTHONUNBUFFERED: "1",
       },
       autorestart: true,
       watch: false,
       max_restarts: 10,
       restart_delay: 3000,
-      time: true
+      time: true,
     },
     {
       name: "qwen-figma-service",
-      cwd: "/root/figma/qwen-figma",
-      script: "/root/figma/qwen-figma/.venv/bin/python",
+      cwd: root,
+      script: py,
       args: "-m qwen_service.run_server",
       interpreter: "none",
       env: {
-        QWEN_MODEL_PATH: "Qwen2.5-VL-7B-Instruct",
-        QWEN_DEVICE: "cuda:1",
-        QWEN_HOST: "127.0.0.1",
-        QWEN_PORT: "10196",
-        QWEN_MAX_NEW_TOKENS: "768",
-        QWEN_TEMPERATURE: "0.0",
-        QWEN_MAX_IMAGE_LONG_SIDE: "1024",
-        PYTHONUNBUFFERED: "1"
+        PYTHONUNBUFFERED: "1",
       },
       autorestart: true,
       watch: false,
       max_restarts: 10,
       restart_delay: 5000,
-      time: true
-    }
-  ]
-}
+      time: true,
+    },
+  ],
+};

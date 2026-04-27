@@ -5,13 +5,14 @@ from pathlib import Path
 from typing import Any
 
 from backend.storage import RunStorage
+from env_load import default_qwen_base_url
 from main import run_pipeline
 
 
 class PipelineRunner:
-    def __init__(self, storage: RunStorage, qwen_base_url: str = "http://127.0.0.1:8001") -> None:
+    def __init__(self, storage: RunStorage, qwen_base_url: str | None = None) -> None:
         self.storage = storage
-        self.qwen_base_url = qwen_base_url
+        self.qwen_base_url = ((qwen_base_url or "").strip() or default_qwen_base_url()).rstrip("/")
 
     def run(
         self,
