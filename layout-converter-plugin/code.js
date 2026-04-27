@@ -97,7 +97,7 @@ function collectImagePaintRefs(root) {
         path,
         node_id: node.id,
         name: node.name,
-        type: node.type,
+        type: normalizeType(node.type),
         image_hash: ih,
         fill_role: role
       });
@@ -122,7 +122,8 @@ function collectImagePaintRefs(root) {
 /** Max leaves packed into the element atlas (same cap as before). */
 const MAX_ELEMENT_LAYER_PNGS = 250;
 
-const ATLAS_GAP = 4;
+/** Space between atlas cells (after each cell on the row, and between rows). Larger = easier to scan atlas.png. */
+const ATLAS_GAP = 12;
 const ATLAS_MAX_ROW_WIDTH = 8192;
 const ATLAS_MAX_CELL = 4096;
 
@@ -232,7 +233,7 @@ async function buildElementAtlasPngAndRegions(root, maxCount) {
         path,
         node_id: node.id,
         name: node.name,
-        type: node.type,
+        type: normalizeType(node.type),
         atlas_x: Math.round(curX),
         atlas_y: Math.round(curY),
         atlas_width: Math.round(cw),
@@ -853,6 +854,11 @@ figma.ui.onmessage = async (msg) => {
       await buildElementAtlasPngAndRegions(selectedFrame, MAX_ELEMENT_LAYER_PNGS);
     injectAtlasRegionsIntoRawJson(rawJson, elementAtlasRegions);
     console.log("Element atlas regions:", elementAtlasRegions.length);
+    if (elementAtlasRegions.length > 32) {
+      console.warn(
+        "Atlas has more than 32 leaves; this backend sends only the first 32 crops to Qwen/VLM (see API_CONVERT_CONTRACT.md).",
+      );
+    }
 
     let targetWidth = selectedFrame.width;
     let targetHeight = selectedFrame.height;
@@ -875,9 +881,7 @@ figma.ui.onmessage = async (msg) => {
     let response;
 
     try {
-      // Backend must accept these keys on the Pydantic/FastAPI model (or parse ``await
-      // request.json()`` before validation). Otherwise Pydantic ``extra='ignore'`` drops
-      // unknown keys (e.g. ``element_atlas_*``).
+      // Backend ``ConvertRequest`` uses ``extra='allow'`` so forward-compatible keys are kept.
       const requestBody = {
         banner_png_base64: pngBase64,
         raw_json: rawJson,

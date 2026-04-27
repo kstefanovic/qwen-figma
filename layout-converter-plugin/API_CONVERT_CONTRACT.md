@@ -74,7 +74,7 @@ Each row marks **where** an `IMAGE` fill/stroke appears in the tree. The plugin 
 
 ### `element_atlas_png_base64` (string, optional)
 
-- **Content:** A **single** PNG whose canvas packs **rasterized leaves** (visible leaves, `INSTANCE` as one leaf, capped count). Row-packed layout with a small gap; coordinates in `element_atlas_regions` and on `raw_json` as `atlas_region`.
+- **Content:** A **single** PNG whose canvas packs **rasterized leaves** (visible leaves, `INSTANCE` as one leaf, capped count). Row-packed layout with a **fixed pixel gap** between cells (see `ATLAS_GAP` in `code.js`); coordinates in `element_atlas_regions` and on `raw_json` as `atlas_region`.
 - **Encoding:** Same Base64 rules as `banner_png_base64`.
 - **Empty atlas:** If there are no qualifying leaves, this is **`""`** and `element_atlas_regions` is `[]` — skip PNG decode for the atlas.
 
@@ -106,9 +106,26 @@ One row per packed leaf, aligned with `raw_json` by **`path`**:
 
 ## Backend checklist
 
-1. Accept all keys above on your Pydantic model (or parse `await request.json()` before strict validation) so fields are not dropped.
+1. Accept all keys above on your Pydantic model with **`extra` not set to `"forbid"`** (this repo uses **`extra="allow"`** on `ConvertRequest`) so optional / future keys are not rejected.
 2. Decode Base64 → **binary** → verify PNG for **`banner_png_base64`** and for **`element_atlas_png_base64` when it is non-empty**.
 3. Allow large request bodies (reverse proxy / app server limits).
+
+---
+
+## Backend persistence (this repo’s `POST /api/convert`)
+
+After a successful request, the server writes under `runs/<run_id>/input/`:
+
+| Path | Meaning |
+|------|---------|
+| `banner.png` | Decoded **`banner_png_base64`**. |
+| `raw_figma.json` | **`raw_json`** as saved JSON (includes **`atlas_region`** if the plugin injected it). |
+| `elements/atlas.png` | Decoded **`element_atlas_png_base64`** when non-empty. |
+| `elements/leaf_NNN.png` | Crops from the atlas (one file per region row, for Qwen / debugging). |
+| `elements/element_atlas_crops_manifest.json` | One JSON row per crop (`path`, `atlas_*`, `saved_as`, …). |
+| `elements/element_image_refs.json` | **`element_image_refs`** only (metadata; no bitmap per `image_hash`). |
+
+**Qwen / VLM limit:** only the **first 32** cropped leaf PNGs are passed as extra scene images (`element_image_paths`), even if the atlas packs more leaves (the plugin may pack up to 250). Remaining crops exist on disk only.
 
 ---
 
