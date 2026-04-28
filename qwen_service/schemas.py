@@ -5,6 +5,12 @@ from typing import Any, Optional
 from pydantic import BaseModel, Field
 
 
+class ZoneClassifyRequest(BaseModel):
+    """Single-banner zone layout classification (no candidates / atlas)."""
+
+    banner_image_path: str
+
+
 class BannerAnnotateRequest(BaseModel):
     banner_image_path: str
     candidate_bundle: dict[str, Any]

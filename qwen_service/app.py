@@ -34,6 +34,7 @@ from qwen_service.schemas import (
     HealthResponse,
     SceneAnnotateRequest,
     SemanticStructureAnnotateRequest,
+    ZoneClassifyRequest,
 )
 
 try:
@@ -164,6 +165,78 @@ class BrandContextAnnotation:
             "reason_short": self.reason_short,
             "raw_model_output": self.raw_model_output,
         }
+
+
+_ZONE_CLASSIFY_ENUM_BLOCK = """
+left_txt_right_img
+right_txt_left_img
+upper_txt_lower_img
+upper_img_lower_txt
+full_bg_txt_left_img_right
+full_bg_txt_center_img_side
+full_bg_txt_overlay_img
+wide_left_brand_center_txt_right_img
+wide_left_txt_center_info_right_img
+price_left_product_right
+price_top_product_bottom
+offer_left_product_right
+offer_center_product_side
+brand_top_txt_left_img_right
+brand_top_txt_center_img_right
+brand_top_img_upper_txt_lower
+img_dominant_txt_overlay
+img_dominant_txt_bottom
+img_dominant_txt_top
+two_panel_vertical_split
+two_panel_horizontal_split
+repeated_card_grid
+txt_only_center
+txt_only_left
+txt_on_background
+background_only
+mixed_complex
+unknown
+""".strip()
+
+
+def _build_zone_classify_prompt() -> str:
+    return f"""
+You are an expert banner layout classifier.
+Given a rendered banner image, classify the overall spatial layout into exactly one zone_type from the allowed enum.
+
+Return JSON only:
+{{
+  "zone_type": "...",
+  "orientation": "...",
+  "confidence": 0.0,
+  "reason": "...",
+  "alternatives": [
+    {{"zone_type": "...", "confidence": 0.0}}
+  ]
+}}
+
+Allowed zone_type values:
+{_ZONE_CLASSIFY_ENUM_BLOCK}
+
+Classification guidance:
+- Choose left_txt_right_img when the main text/offer is mainly on the left and the main image/product/person is mainly on the right.
+- Choose right_txt_left_img when the main image is on the left and text is on the right.
+- Choose upper_img_lower_txt when image/photo dominates the upper area and text/brand/offer is below.
+- Choose upper_txt_lower_img when text dominates the upper area and product/image is below.
+- Choose full_bg_txt_overlay_img when text is placed over or inside an image/background rather than in a clean split.
+- Choose full_bg_txt_center_img_side when central text is surrounded by side/background decorative images.
+- Choose wide_left_brand_center_txt_right_img for very wide banners where brand is left, main text is center, and hero/product image is right.
+- Choose price_left_product_right when price is the dominant text on the left and product is on the right.
+- Choose price_top_product_bottom when price is top/upper and product is lower.
+- Choose offer_left_product_right when offer/headline is left and product image is right, but price is not the dominant element.
+- Choose brand_top_txt_left_img_right when brand appears near top and main text left, image right.
+- Choose brand_top_img_upper_txt_lower when brand is top and image/photo is upper with offer text below, often portrait.
+- Choose img_dominant_txt_overlay when the image dominates and text overlays it.
+- Choose txt_on_background when the design is mostly text on colored/graphic background with no clear hero product image.
+- Choose background_only if the frame is only a background or placeholder with no meaningful text/hero.
+- Choose mixed_complex if multiple zones/panels exist and one type cannot describe it.
+- Choose unknown only if classification is impossible.
+""".strip()
 
 
 def _slugify_machine_brand(value: str) -> str:
@@ -1099,6 +1172,50 @@ Return JSON only:
             reason_short=str(data.get("reason_short", "")),
             raw_model_output=raw_output,
         )
+
+    def classify_zone(self, request: ZoneClassifyRequest) -> dict[str, Any]:
+        image = self._load_image(request.banner_image_path)
+        image = self._prepare_image_for_model(image, "classify_zone/banner")
+        logger.info(
+            "classify_zone model input: banner=%dx%d path=%r",
+            image.width,
+            image.height,
+            request.banner_image_path,
+        )
+        prompt = _build_zone_classify_prompt()
+        raw_output = self._run_model([image], prompt, max_new_tokens=min(int(self.max_new_tokens), 512))
+        data = self._extract_json(raw_output)
+        if not isinstance(data, dict):
+            return {
+                "zone_type": "unknown",
+                "orientation": "unknown",
+                "confidence": 0.0,
+                "reason": "Failed to parse model JSON output.",
+                "alternatives": [],
+                "raw_model_output": raw_output,
+                "json_parse_ok": False,
+            }
+        alts: list[dict[str, Any]] = []
+        for item in data.get("alternatives") or []:
+            if isinstance(item, dict):
+                try:
+                    c = float(item.get("confidence", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    c = 0.0
+                alts.append({"zone_type": str(item.get("zone_type", "") or ""), "confidence": c})
+        try:
+            conf = float(data.get("confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            conf = 0.0
+        return {
+            "zone_type": str(data.get("zone_type", "") or "unknown"),
+            "orientation": str(data.get("orientation", "") or "unknown"),
+            "confidence": conf,
+            "reason": str(data.get("reason", "") or ""),
+            "alternatives": alts,
+            "raw_model_output": raw_output,
+            "json_parse_ok": True,
+        }
 
     def annotate_candidate(self, request: CandidateAnnotateRequest) -> CandidateAnnotation:
         candidate_id = str(request.candidate.get("candidate_id", "unknown_candidate"))
@@ -2102,6 +2219,14 @@ def create_app(
             return runtime.annotate_banner(request).to_dict()
         except Exception as e:
             logger.exception("annotate_banner failed")
+            raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}") from e
+
+    @app.post("/annotate/zone-classify")
+    def annotate_zone_classify(request: ZoneClassifyRequest) -> dict[str, Any]:
+        try:
+            return runtime.classify_zone(request)
+        except Exception as e:
+            logger.exception("annotate_zone_classify failed")
             raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}") from e
 
     @app.post("/annotate/candidate")

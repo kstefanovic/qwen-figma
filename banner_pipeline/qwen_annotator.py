@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import logging
-
-from env_load import default_qwen_base_url
+import os
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from env_load import default_qwen_base_url
 from typing import Any, Optional
 
 import requests
@@ -573,6 +575,31 @@ class QwenAnnotator:
                     f"Group candidate annotation failed for candidate_id={candidate.candidate_id!r}: {e}"
                 ) from e
         return out
+
+    def classify_zone_from_banner(self, banner_png: bytes) -> dict[str, Any]:
+        """
+        Single ``/annotate/zone-classify`` call with one prepared raster (JPEG/PNG bytes).
+
+        Writes a temporary file on this host; the Qwen service must be able to read the same path
+        (typical co-located deployment).
+        """
+        suffix = ".jpg"
+        if len(banner_png) >= 8 and banner_png[:8] == b"\x89PNG\r\n\x1a\n":
+            suffix = ".png"
+        fd, path_str = tempfile.mkstemp(prefix="v2_zone_", suffix=suffix)
+        os.close(fd)
+        path = Path(path_str)
+        try:
+            path.write_bytes(banner_png)
+            return self._post(
+                "/annotate/zone-classify",
+                {"banner_image_path": str(path.resolve())},
+            )
+        finally:
+            try:
+                path.unlink()
+            except OSError:
+                pass
 
     def _post(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
         payload_size_bytes = self._estimate_payload_size_bytes(payload)
