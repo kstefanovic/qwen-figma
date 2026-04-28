@@ -182,15 +182,15 @@ _CLASSIFY_ZONE_V2_ZONE_TYPES = frozenset(
 
 
 def _deterministic_orientation_from_dims(width: int, height: int) -> str:
-    """Rules for v2 /classify-zone (from pixel dimensions)."""
+    """Rules for v2 (from pixel dimensions): wide if w/h >= 3; else landscape if w>h and r<3; portrait if h>w."""
     if width < 1 or height < 1:
         return "landscape"
     r = width / float(height)
-    if r > 3.0:
+    if r >= 3.0:
         return "wide"
-    if width > height:
+    if width > height and r < 3.0:
         return "landscape"
-    if width < height:
+    if height > width:
         return "portrait"
     return "landscape"
 
@@ -211,8 +211,10 @@ whole_text_no_image
 upper_text_mid_image_lower_text
 
 Orientation rules:
-- wide if width / height > 3
-- otherwise: if width > height then landscape; if width < height then portrait (if width equals height, use landscape)
+- wide if width / height >= 3.0
+- landscape if width > height and width / height < 3.0
+- portrait if height > width
+- if width equals height, use landscape
 
 Zone type rules:
 - left_text_right_image: text/brand/offer/price mainly on left, main product/person/hero image mainly on right. Use this for both landscape and wide banners when this left/right structure exists.
@@ -235,6 +237,281 @@ Do not classify decorative lights/leaves/sparkles as the main image.
 
 The orientation value in your JSON must match the image pixel dimensions using the orientation rules above (compute from width and height).
 """.strip()
+
+
+_TEXT_ZONE_VISUAL_ROLES = frozenset({"brand_group", "headline_group", "legal_text"})
+_TEXT_ZONE_LEGACY_LOGO_ROLE = "logo_group"
+
+
+def _build_analyze_text_zone_visual_prompt() -> str:
+    return """
+You are an expert banner typography and text-zone detector.
+
+You receive one rendered banner image.
+
+First classify:
+1. orientation
+2. zone_type
+
+Then detect ONLY these visual text groups:
+- brand_group
+- headline_group
+- legal_text
+
+Use visual typography, size, weight, position, and hierarchy.
+
+Orientation rules:
+- wide: width / height >= 3.0
+- landscape: width > height and width / height < 3.0
+- portrait: height > width
+
+Allowed orientation values:
+landscape, wide, portrait
+
+Allowed zone_type values:
+left_text_right_image
+upper_image_lower_text
+whole_text_no_image
+upper_text_mid_image_lower_text
+
+Zone type definitions:
+- left_text_right_image: main text/brand/offer is mostly on the left and the main product/person/image is mostly on the right. Use also for wide banners with this structure.
+- upper_image_lower_text: main image/photo is in the upper part and text/brand/offer/legal is in the lower part.
+- whole_text_no_image: mostly text on background and no main product/person/hero image. Decorative leaves/lights/sparkles do not count as main image.
+- upper_text_mid_image_lower_text: portrait layout where upper area has text/brand/price/headline, middle has main product/image, and lower has legal/badge/small text.
+
+Allowed text group roles:
+brand_group
+headline_group
+legal_text
+
+Definitions:
+brand_group = compact brand/logo identity block such as Яндекс Лавка, Яндекс Маркет, DoorDash, Золотое Яблоко. Usually smaller than headline and often near top or upper text area. Include logo mark + brand name as one bbox.
+headline_group = main promotional copy. Largest/boldest/dominant text. Can include subheadline or large price when it functions as the main offer. Do not create a separate price_group.
+legal_text = tiny dense legal/regulatory text, usually bottom or lower area, low visual priority. Do not confuse readable subheadline attached to the main message with legal_text.
+
+Zone-aware guidance:
+- left_text_right_image: brand_group and headline_group are usually in the left text area; legal_text often below them.
+- upper_image_lower_text: text groups are usually in the lower block; brand_group may start the lower block; headline_group is dominant lower text; legal_text near the bottom.
+- upper_text_mid_image_lower_text: brand_group and headline_group in the upper area; do not detect the middle product/image; legal_text in the lower area.
+- whole_text_no_image: detect brand_group, headline_group, legal_text if present.
+
+Return JSON only:
+{
+  "orientation": "...",
+  "zone_type": "...",
+  "confidence": 0.0,
+  "reason": "...",
+  "text_zone": {
+    "groups": [
+      {
+        "role": "brand_group",
+        "bbox": {"x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0},
+        "confidence": 0.0,
+        "reason": "..."
+      },
+      {
+        "role": "headline_group",
+        "bbox": {"x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0},
+        "confidence": 0.0,
+        "reason": "..."
+      },
+      {
+        "role": "legal_text",
+        "bbox": {"x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0},
+        "confidence": 0.0,
+        "reason": "..."
+      }
+    ]
+  }
+}
+
+Rules:
+- Return JSON only.
+- Do not wrap the JSON in markdown code fences (no ```).
+- Do not output markdown.
+- Do not invent extra roles.
+- Do not output logo_group.
+- Do not detect product/person/image/background/decoration.
+- Omit absent groups.
+- Bboxes must be normalized from 0.0 to 1.0 relative to the full image (x=left/w, y=top/h, width=box_w/w, height=box_h/h).
+- Each bbox must be a JSON object with exactly these numeric keys: "x", "y", "width", "height". Do not use arrays. Do not write bare numbers after "x": without "y"/"width"/"height" key names.
+- Bboxes should tightly cover only the visual text group; do not include hero/product/image areas inside text group bboxes.
+- Use typography hierarchy: largest/boldest main message is headline_group; compact brand identity is brand_group; tiny dense disclaimer is legal_text.
+
+The orientation value must match width and height of the image pixels using the orientation rules above.
+""".strip()
+
+
+def _coerce_float01(v: Any) -> float | None:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _clamp_unit_interval(v: float) -> float:
+    if v < 0.0:
+        return 0.0
+    if v > 1.0:
+        return 1.0
+    return v
+
+
+def _repair_json_bbox_common_errors(text: str) -> str:
+    """
+    Fix invalid JSON the VLM often emits, e.g.:
+    \"bbox\": {\"x\": 146, 38, 217, 114}  (missing \"y\"/\"width\"/\"height\" keys)
+    """
+    if not text:
+        return text
+    text = re.sub(
+        r'"bbox"\s*:\s*\{\s*"x"\s*:\s*([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)\s*\}',
+        r'"bbox": {"x": \1, "y": \2, "width": \3, "height": \4}',
+        text,
+    )
+    text = re.sub(
+        r'"bbox"\s*:\s*\{\s*([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)\s*\}',
+        r'"bbox": {"x": \1, "y": \2, "width": \3, "height": \4}',
+        text,
+    )
+    return text
+
+
+def _clamp_norm_bbox_dict(x: float, y: float, w: float, h: float) -> dict[str, float] | None:
+    x = _clamp_unit_interval(float(x))
+    y = _clamp_unit_interval(float(y))
+    w = max(0.0, min(1.0, float(w)))
+    h = max(0.0, min(1.0, float(h)))
+    if w <= 1e-6 or h <= 1e-6:
+        return None
+    if x + w > 1.0:
+        w = max(1e-6, 1.0 - x)
+    if y + h > 1.0:
+        h = max(1e-6, 1.0 - y)
+    return {"x": x, "y": y, "width": w, "height": h}
+
+
+def _finalize_normalized_bbox(
+    b: Any,
+    pixel_w: int,
+    pixel_h: int,
+) -> dict[str, float] | None:
+    """
+    Normalize bbox to 0..1. Accepts dict {x,y,width,height} or 4-number list/tuple.
+    If any coordinate magnitude suggests pixels (max > 1), convert using pixel_w x pixel_h.
+    For lists in pixel space, values are treated as x1,y1,x2,y2 (two corners).
+    For dicts in pixel space, values are x,y,width,height.
+    """
+    pw = max(1, int(pixel_w))
+    ph = max(1, int(pixel_h))
+
+    if isinstance(b, (list, tuple)) and len(b) == 4:
+        fv = [_coerce_float01(x) for x in b]
+        if any(v is None for v in fv):
+            return None
+        a, c, d, e = float(fv[0]), float(fv[1]), float(fv[2]), float(fv[3])
+        if max(a, c, d, e) > 1.0:
+            if d > a and e > c and (d - a) <= pw * 1.02 and (e - c) <= ph * 1.02:
+                x_px, y_px, w_px, h_px = a, c, d - a, e - c
+            else:
+                x_px, y_px, w_px, h_px = a, c, d, e
+            if w_px <= 0 or h_px <= 0:
+                return None
+            x, y, w, h = x_px / pw, y_px / ph, w_px / pw, h_px / ph
+        else:
+            x, y, w, h = a, c, d, e
+        return _clamp_norm_bbox_dict(x, y, w, h)
+
+    if not isinstance(b, dict):
+        return None
+    x = _coerce_float01(b.get("x"))
+    y = _coerce_float01(b.get("y"))
+    w = _coerce_float01(b.get("width"))
+    h = _coerce_float01(b.get("height"))
+    if x is None or y is None or w is None or h is None:
+        return None
+    if max(x, y, w, h) > 1.0:
+        x, y, w, h = x / float(pw), y / float(ph), w / float(pw), h / float(ph)
+    return _clamp_norm_bbox_dict(x, y, w, h)
+
+
+def _dedupe_text_zone_groups_by_role(
+    groups: list[dict[str, Any]],
+    warnings: list[str],
+) -> list[dict[str, Any]]:
+    """Keep a single group per role — highest confidence wins (ties keep first seen)."""
+    by_role: dict[str, dict[str, Any]] = {}
+    for g in groups:
+        role = str(g.get("role", "") or "")
+        try:
+            cf = float(g.get("confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            cf = 0.0
+        prev = by_role.get(role)
+        if prev is None:
+            by_role[role] = g
+            continue
+        try:
+            pcf = float(prev.get("confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            pcf = 0.0
+        if cf > pcf:
+            warnings.append(
+                f"Duplicate role={role!r}: kept higher confidence ({cf:.4f} vs dropped {pcf:.4f})",
+            )
+            by_role[role] = g
+        else:
+            warnings.append(
+                f"Duplicate role={role!r}: dropped lower confidence ({cf:.4f} vs kept {pcf:.4f})",
+            )
+    order = ("brand_group", "headline_group", "legal_text")
+    return [by_role[r] for r in order if r in by_role]
+
+
+def _finalize_text_zone_groups(
+    raw: Any,
+    warnings: list[str],
+    *,
+    pixel_w: int,
+    pixel_h: int,
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    if not isinstance(raw, dict):
+        return out
+    groups = raw.get("groups")
+    if not isinstance(groups, list):
+        return out
+    for i, item in enumerate(groups):
+        if not isinstance(item, dict):
+            continue
+        role_raw = str(item.get("role", "") or "").strip()
+        if role_raw == _TEXT_ZONE_LEGACY_LOGO_ROLE:
+            warnings.append(f"text_zone.groups[{i}]: role logo_group converted to brand_group")
+            role = "brand_group"
+        else:
+            role = role_raw
+        if role not in _TEXT_ZONE_VISUAL_ROLES:
+            warnings.append(f"Dropped text_zone.groups[{i}] invalid role={role_raw!r}")
+            continue
+        bbox = _finalize_normalized_bbox(item.get("bbox"), pixel_w, pixel_h)
+        if bbox is None:
+            warnings.append(f"Dropped text_zone.groups[{i}] role={role!r} invalid bbox")
+            continue
+        try:
+            gc = float(item.get("confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            gc = 0.0
+        gr = str(item.get("reason", "") or "")
+        out.append(
+            {
+                "role": role,
+                "bbox": bbox,
+                "confidence": gc,
+                "reason": gr,
+            }
+        )
+    return _dedupe_text_zone_groups_by_role(out, warnings)
 
 
 def _slugify_machine_brand(value: str) -> str:
@@ -875,7 +1152,7 @@ class QwenRuntime:
         return None
 
     def _json_load_relaxed(self, text: str) -> Any:
-        candidate = (text or "").strip()
+        candidate = _repair_json_bbox_common_errors((text or "").strip())
         if not candidate:
             return None
         try:
@@ -1267,6 +1544,113 @@ Return JSON only:
             "zone_type": zt,
             "confidence": conf,
             "reason": reason,
+        }
+
+    def analyze_text_zone_visual(self, request: ZoneClassifyRequest) -> dict[str, Any]:
+        """
+        One VLM call: orientation + zone_type + text_zone.groups (normalized bboxes only).
+        No Figma IDs, paths, atlas, or candidate/group annotate routes.
+        """
+        warnings: list[str] = []
+        logger.info("analyze_text_zone_visual: endpoint called path=%r", request.banner_image_path)
+        raw_img = self._load_image(request.banner_image_path)
+        ow, oh = raw_img.size
+        work = raw_img
+        max_pre = int(CLASSIFY_ZONE_V2_MAX_LONG_SIDE)
+        m = max(ow, oh)
+        if m > max_pre and m > 0:
+            scale = max_pre / float(m)
+            rw = max(1, int(round(ow * scale)))
+            rh = max(1, int(round(oh * scale)))
+            work = work.resize((rw, rh), _LANCZOS)
+        rw2, rh2 = work.size
+        logger.info(
+            "analyze_text_zone_visual: original_image=%dx%d resized_before_model_prep=%dx%d",
+            ow,
+            oh,
+            rw2,
+            rh2,
+        )
+        image = self._prepare_image_for_model(work, "analyze_text_zone_visual/banner")
+        fw, fh = image.size
+        logger.info("analyze_text_zone_visual: prepared_for_vlm=%dx%d", fw, fh)
+
+        det_orientation = _deterministic_orientation_from_dims(ow, oh)
+        prompt = _build_analyze_text_zone_visual_prompt()
+        t0 = time.perf_counter()
+        raw_output = self._run_model(
+            [image],
+            prompt,
+            max_new_tokens=min(int(self.max_new_tokens), 768),
+        )
+        qwen_elapsed = time.perf_counter() - t0
+        logger.info("analyze_text_zone_visual: qwen_elapsed_seconds=%.4f", qwen_elapsed)
+
+        data = self._extract_json(raw_output)
+        if not isinstance(data, dict):
+            logger.warning(
+                "analyze_text_zone_visual: invalid JSON from model raw_len=%d",
+                len(raw_output or ""),
+            )
+            raise ClassifyZoneUnparseableModelOutput(raw_output or "")
+
+        model_orientation = str(data.get("orientation", "") or "").strip()
+        zt = str(data.get("zone_type", "") or "").strip()
+        try:
+            conf = float(data.get("confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            conf = 0.0
+        reason = str(data.get("reason", "") or "")
+
+        ori = det_orientation
+        if model_orientation and model_orientation != det_orientation:
+            logger.info(
+                "analyze_text_zone_visual: model_orientation=%r overridden by geometry=%r (%dx%d)",
+                model_orientation,
+                det_orientation,
+                ow,
+                oh,
+            )
+
+        if zt not in _CLASSIFY_ZONE_V2_ZONE_TYPES:
+            warn = (
+                "Model zone_type not in allowed set; normalized to whole_text_no_image "
+                "(allowed: left_text_right_image, upper_image_lower_text, "
+                "whole_text_no_image, upper_text_mid_image_lower_text)."
+            )
+            zt = "whole_text_no_image"
+            conf = min(conf, 0.2)
+            reason = f"{reason} {warn}".strip() if reason else warn
+            warnings.append(warn)
+            logger.warning("analyze_text_zone_visual: invalid zone_type from model")
+
+        tz_raw = data.get("text_zone")
+        groups_out = _finalize_text_zone_groups(tz_raw, warnings, pixel_w=fw, pixel_h=fh)
+
+        logger.info(
+            "analyze_text_zone_visual: endpoint=POST/analyze-text-zone-visual orientation=%r "
+            "zone_type=%r text_zone_group_count=%d warnings=%d",
+            ori,
+            zt,
+            len(groups_out),
+            len(warnings),
+        )
+        if warnings:
+            logger.info("analyze_text_zone_visual: validation_warnings=%s", warnings)
+        for g in groups_out:
+            logger.info(
+                "analyze_text_zone_visual: group role=%r confidence=%.4f bbox=%s",
+                g.get("role"),
+                float(g.get("confidence", 0.0) or 0.0),
+                g.get("bbox"),
+            )
+
+        return {
+            "orientation": ori,
+            "zone_type": zt,
+            "confidence": conf,
+            "reason": reason,
+            "text_zone": {"groups": groups_out},
         }
 
     def annotate_candidate(self, request: CandidateAnnotateRequest) -> CandidateAnnotation:
@@ -2289,6 +2673,24 @@ def create_app(
             ) from e
         except Exception as e:
             logger.exception("classify_zone failed")
+            raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}") from e
+
+    @app.post("/analyze-text-zone-visual")
+    def analyze_text_zone_visual_endpoint(request: ZoneClassifyRequest) -> dict[str, Any]:
+        try:
+            return runtime.analyze_text_zone_visual(request)
+        except ClassifyZoneUnparseableModelOutput as e:
+            raw = str(e) if e else ""
+            logger.exception("analyze_text_zone_visual: model JSON parse failed")
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": "Model output was not valid JSON after extraction attempts.",
+                    "raw_model_output": raw[:16000],
+                },
+            ) from e
+        except Exception as e:
+            logger.exception("analyze_text_zone_visual failed")
             raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}") from e
 
     @app.post("/annotate/candidate")

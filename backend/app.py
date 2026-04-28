@@ -25,9 +25,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from backend.convert_scene import build_convert_semantic_payload
+from backend.pipeline_v2.analyze_text_zone_visual import analyze_text_zone_visual_from_banner_bytes
 from backend.pipeline_v2.qwen_zone_classifier import classify_zone_from_banner_bytes
-from backend.pipeline_v2.schemas import ClassifyZonePluginRequest, ClassifyZoneResponse
+from backend.pipeline_v2.schemas import (
+    AnalyzeTextZoneVisualResponse,
+    ClassifyZonePluginRequest,
+    ClassifyZoneResponse,
+)
 from backend.runner import PipelineRunner
+from banner_pipeline.qwen_annotator import QwenServiceHTTPError
 from backend.schemas import (
     ConvertDebug,
     ConvertFrameSpec,
@@ -298,6 +304,33 @@ def _build_convert_annotation_context(run_id: str, pipeline_result: dict[str, An
     }
 
 
+def _qwen_error_response_detail(body: Any) -> Any:
+    if isinstance(body, dict) and "detail" in body:
+        return body["detail"]
+    return body
+
+
+def _analyze_text_zone_visual_from_raw_bytes(raw: bytes) -> AnalyzeTextZoneVisualResponse:
+    try:
+        return analyze_text_zone_visual_from_banner_bytes(raw, qwen_base_url=QWEN_BASE_URL)
+    except QwenServiceHTTPError as exc:
+        if exc.status_code == 422:
+            raise HTTPException(
+                status_code=422,
+                detail=_qwen_error_response_detail(exc.response_body),
+            ) from exc
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid image or preprocessing failed: {type(exc).__name__}: {exc}",
+        ) from exc
+
+
 def _classify_zone_v2_from_raw_bytes(raw: bytes) -> ClassifyZoneResponse | JSONResponse:
     """Shared handler for multipart and JSON plugin entrypoints."""
     try:
@@ -368,6 +401,48 @@ async def classify_zone_v2_plugin_json(body: ClassifyZonePluginRequest = Body(..
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return _classify_zone_v2_from_raw_bytes(raw)
+
+
+@app.post(
+    "/api/v2/analyze-text-zone-visual",
+    response_model=AnalyzeTextZoneVisualResponse,
+    responses={
+        422: {"description": "Qwen model output was not valid JSON."},
+        502: {"description": "Qwen service error."},
+    },
+)
+async def analyze_text_zone_visual_v2(
+    banner_png: UploadFile = File(..., description="Banner raster (PNG/JPEG/WebP)."),
+) -> AnalyzeTextZoneVisualResponse:
+    """
+    v2: banner.png only — orientation, zone_type, and text_zone.groups (normalized bboxes).
+    No raw JSON, atlas, or Figma node mapping.
+    """
+    if not banner_png.filename:
+        raise HTTPException(status_code=400, detail="banner_png filename is missing.")
+    raw = await banner_png.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="banner_png is empty.")
+    return _analyze_text_zone_visual_from_raw_bytes(raw)
+
+
+@app.post(
+    "/api/v2/analyze-text-zone-visual-json",
+    response_model=AnalyzeTextZoneVisualResponse,
+    responses={
+        422: {"description": "Qwen model output was not valid JSON."},
+        502: {"description": "Qwen service error."},
+    },
+)
+async def analyze_text_zone_visual_v2_json(
+    body: ClassifyZonePluginRequest = Body(...),
+) -> AnalyzeTextZoneVisualResponse:
+    """Same as ``/api/v2/analyze-text-zone-visual`` with JSON + strict PNG base64 (plugin-friendly)."""
+    try:
+        raw = _decode_png_base64(body.banner_png_base64)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _analyze_text_zone_visual_from_raw_bytes(raw)
 
 
 @app.get("/api/health", response_model=HealthResponse)

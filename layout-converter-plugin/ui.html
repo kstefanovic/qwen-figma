@@ -60,10 +60,13 @@
       }
 
       .zone-result {
-        min-height: 120px;
-        white-space: pre-wrap;
-        font-size: 12px;
-        line-height: 1.45;
+        min-height: 160px;
+        max-height: 280px;
+        overflow: auto;
+        white-space: pre;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font-size: 11px;
+        line-height: 1.4;
         padding: 10px;
         border-radius: 6px;
         border: 1px solid #e5e5e5;
@@ -111,14 +114,16 @@
 
     <div class="row">
       <button id="classify-zone-btn" type="button" style="background: #7c3aed">
-        Classify Zone (v2 test)
+        Zone + text zones (v2 JSON)
       </button>
     </div>
 
     <div class="row">
       <label>Zone classification (Qwen v2)</label>
       <div id="zone-result" class="zone-result readonly">
-        Run “Classify Zone” on one selected frame (JSON to /api/v2/classify-zone-json). No clone, no /api/convert.
+        Run the purple button on one selected frame. Pretty-printed JSON from
+        POST /api/v2/analyze-text-zone-visual-json (orientation, zone_type,
+        text_zone.groups: brand_group, headline_group, legal_text).
       </div>
     </div>
 
@@ -180,7 +185,7 @@
 
       classifyZoneBtn.onclick = () => {
         const backendUrl = document.getElementById("backend-url").value.trim();
-        setStatus("Classify zone: exporting frame…");
+        setStatus("Zone + text zones (v2): exporting frame…");
         setZoneResult("…");
         parent.postMessage(
           {
@@ -207,20 +212,14 @@
           setSelectedFrameInfo(msg.selection);
         } else if (msg.type === "zone-classify-result") {
           if (!msg.ok || !msg.result) {
-            setZoneResult("Classification failed. See status above.");
+            setZoneResult("Request failed. See status above.");
             return;
           }
-          const r = msg.result;
-          setZoneResult(
-            `zone_type: ${r.zone_type}\n` +
-              `confidence: ${Number(r.confidence).toFixed(4)}\n` +
-              `orientation: ${r.orientation != null ? r.orientation : "—"}\n` +
-              `reason:\n${r.reason != null ? r.reason : "—"}\n` +
-              (r.run_id ? `\nrun_id: ${r.run_id}` : "") +
-              (r.debug && typeof r.debug === "object"
-                ? `\n\ndebug: qwen_call_count=${r.debug.qwen_call_count} elapsed_seconds=${r.debug.elapsed_seconds}`
-                : "")
-          );
+          try {
+            setZoneResult(JSON.stringify(msg.result, null, 2));
+          } catch (e) {
+            setZoneResult(String(msg.result));
+          }
         }
       };
     </script>

@@ -50,6 +50,20 @@ def _format_qwen_service_http_error(endpoint: str, resp: requests.Response) -> s
     return f"Qwen service request failed: {endpoint} status={resp.status_code} detail={detail}"
 
 
+class QwenServiceHTTPError(Exception):
+    """Raised when the Qwen HTTP API returns a non-success status (e.g. 422 unparseable JSON)."""
+
+    def __init__(self, *, status_code: int, endpoint: str, response_body: Any) -> None:
+        self.status_code = int(status_code)
+        self.endpoint = endpoint
+        self.response_body = response_body
+        try:
+            tail = json.dumps(response_body, ensure_ascii=False)[:4000]
+        except (TypeError, ValueError):
+            tail = str(response_body)[:4000]
+        super().__init__(f"Qwen service request failed: {endpoint} status={status_code} body={tail}")
+
+
 @dataclass
 class BannerAnnotation:
     layout_pattern: str = "unknown"
@@ -601,6 +615,28 @@ class QwenAnnotator:
             except OSError:
                 pass
 
+    def analyze_text_zone_visual_from_banner(self, banner_png: bytes) -> dict[str, Any]:
+        """
+        Single ``POST /analyze-text-zone-visual`` (orientation, zone_type, text_zone.groups).
+        """
+        suffix = ".jpg"
+        if len(banner_png) >= 8 and banner_png[:8] == b"\x89PNG\r\n\x1a\n":
+            suffix = ".png"
+        fd, path_str = tempfile.mkstemp(prefix="v2_txtzone_", suffix=suffix)
+        os.close(fd)
+        path = Path(path_str)
+        try:
+            path.write_bytes(banner_png)
+            return self._post(
+                "/analyze-text-zone-visual",
+                {"banner_image_path": str(path.resolve())},
+            )
+        finally:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
     def _post(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
         payload_size_bytes = self._estimate_payload_size_bytes(payload)
         image_size = self._read_image_size(payload)
@@ -628,5 +664,15 @@ class QwenAnnotator:
             resp.status_code,
         )
         if not resp.ok:
+            try:
+                parsed_body = resp.json()
+            except Exception:
+                parsed_body = (resp.text or "").strip()[:8000] or "(empty response body)"
+            if resp.status_code == 422:
+                raise QwenServiceHTTPError(
+                    status_code=422,
+                    endpoint=endpoint,
+                    response_body=parsed_body,
+                )
             raise RuntimeError(_format_qwen_service_http_error(endpoint, resp))
         return resp.json()

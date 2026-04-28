@@ -11,17 +11,21 @@ ZONE_TYPES: frozenset[str] = frozenset(
 
 ORIENTATIONS: frozenset[str] = frozenset({"landscape", "wide", "portrait"})
 
+TEXT_ZONE_GROUP_ROLES: frozenset[str] = frozenset(
+    {"brand_group", "headline_group", "legal_text"},
+)
+
 
 def deterministic_orientation(width: int, height: int) -> str:
     """Same rules as Qwen service v2 (pixel dimensions)."""
     if width < 1 or height < 1:
         return "landscape"
     r = width / float(height)
-    if r > 3.0:
+    if r >= 3.0:
         return "wide"
-    if width > height:
+    if width > height and r < 3.0:
         return "landscape"
-    if width < height:
+    if height > width:
         return "portrait"
     return "landscape"
 
@@ -34,3 +38,8 @@ def is_allowed_zone_type(value: str) -> bool:
 def is_allowed_orientation(value: str) -> bool:
     s = (value or "").strip()
     return s in ORIENTATIONS
+
+
+def is_allowed_text_zone_role(value: str) -> bool:
+    s = (value or "").strip()
+    return s in TEXT_ZONE_GROUP_ROLES

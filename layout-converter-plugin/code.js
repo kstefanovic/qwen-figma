@@ -3,10 +3,10 @@
  * ``API_CONVERT_CONTRACT.md``. Raster payload is **two** Base64 PNGs only: full banner +
  * one element atlas (no per-hash image library).
  *
- * ``POST …/api/v2/classify-zone-json`` (JSON ``banner_png_base64``, same style as ``/api/convert``):
- * zone classification test — no raw JSON tree, atlas, clone, or layer renames.
+ * ``POST …/api/v2/analyze-text-zone-visual-json`` (JSON ``banner_png_base64``, same style as ``/api/convert``):
+ * orientation, zone_type, and ``text_zone.groups`` (brand_group, headline_group, legal_text + normalized bboxes) — banner only; no atlas/raw tree.
  */
-figma.showUI(__html__, { width: 400, height: 520 });
+figma.showUI(__html__, { width: 400, height: 580 });
 
 function normalizeType(type) {
   return String(type || "").toLowerCase().replace(/_/g, " ");
@@ -897,13 +897,13 @@ figma.ui.onmessage = async (msg) => {
       postError("Backend URL is empty.");
       return;
     }
-    const requestUrl = backendUrl + "/api/v2/classify-zone-json";
+    const requestUrl = backendUrl + "/api/v2/analyze-text-zone-visual-json";
     try {
       postStatus("Exporting banner.png…");
       const pngBytes = await exportFramePngBytes(selectedFrame);
       const pngBase64 = uint8ToBase64(pngBytes);
-      postStatus("Calling zone classification…");
-      console.log("POST zone classify:", requestUrl);
+      postStatus("Calling visual zone + text-zone analysis…");
+      console.log("POST analyze-text-zone-visual:", requestUrl);
       const requestBody = { banner_png_base64: pngBase64 };
       const response = await fetch(requestUrl, {
         method: "POST",
@@ -931,19 +931,11 @@ figma.ui.onmessage = async (msg) => {
       if (!data || typeof data !== "object") {
         throw new Error("Invalid JSON from backend.");
       }
-      postStatus("Zone classification complete.");
+      postStatus("Zone + text-zone analysis complete.");
       figma.ui.postMessage({
         type: "zone-classify-result",
         ok: true,
-        result: {
-          run_id: data.run_id,
-          mode: data.mode,
-          zone_type: data.zone_type,
-          orientation: data.orientation,
-          confidence: data.confidence,
-          reason: data.reason,
-          debug: data.debug,
-        },
+        result: data,
       });
       figma.notify(
         "Zone: " +
@@ -956,7 +948,7 @@ figma.ui.onmessage = async (msg) => {
       figma.ui.postMessage({ type: "done" });
       sendSelectionInfo();
     } catch (err) {
-      console.error("Classify zone failed:", err);
+      console.error("Analyze text-zone visual failed:", err);
       var msgText =
         err && err.stack
           ? err.message + "\n\n" + err.stack
