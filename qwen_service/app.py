@@ -169,6 +169,9 @@ class BrandContextAnnotation:
 
 
 CLASSIFY_ZONE_V2_MAX_LONG_SIDE = 1280
+# Nested text_zone.groups + children needs a higher ceiling than short classify-zone JSON.
+ANALYZE_TEXT_ZONE_VISUAL_MIN_NEW_TOKENS = 3072
+ANALYZE_TEXT_ZONE_VISUAL_MAX_NEW_TOKENS_CAP = 8192
 
 _CLASSIFY_ZONE_V2_ORIENTATIONS = frozenset({"landscape", "wide", "portrait"})
 _CLASSIFY_ZONE_V2_ZONE_TYPES = frozenset(
@@ -245,58 +248,77 @@ _TEXT_ZONE_LEGACY_LOGO_ROLE = "logo_group"
 
 def _build_analyze_text_zone_visual_prompt() -> str:
     return """
-You are an expert banner typography and text-zone detector.
+You are an expert banner typography and text-zone parser.
 
 You receive one rendered banner image.
+
+**CRITICAL (downstream contract):**
+1) Put the **actual string** read from the image in the JSON **`"text"`** field for **every** child except `logo` / `logo_back` / `logo_fore`. For those three roles **`"text"` must always be `""`** (marks/shapes only — **never** put readable words like **Яндекс** or **Лавка** there). **Do not** leave `"text": ""` on **`brand_name` / `brand_name_first` / `brand_name_second`** when the word is visible. Do **not** hide copy only inside `"reason"`.
+2) **`brand_group` row «Яндекс [heart] Лавка»** (or any **two words + symbol between**): output **exactly** `brand_name_first` (left word, non-empty `text`) + **`logo`** (the **whole** icon cell between words, **`"text": ""`**) + `brand_name_second` (right word, non-empty `text`). **Forbidden:** using **`logo_fore`** or **`logo_back`** for either **word** — `logo_fore` is only the **foreground graphic** (e.g. heart) on a badge when you **split** plate vs mark; it is **not** the word **Лавка**. Do not label the left word as `logo`.
+3) **Assign each readable marketing line to exactly one role once** — no duplicate strings across `brand_group` and `headline_group`. The **service / app name** (e.g. **Яндекс + logo + Лавка**, "DoorDash", "Uber Eats") belongs **only** in **`brand_group`** children. **Never** put that brand line as **`headline`**. **`headline`** is the main **offer / CTA / campaign promise** (e.g. «Доставим лекарства из аптек», "Groceries delivered"). **Visual rule:** the **brand row may use a larger point size than the offer line** — still treat the **identity row** as `brand_group` and the **offer line** as `headline`; **do not** pick `headline` by largest font alone.
+4) **`headline_group` stacking:** **`headline`** = the dominant **offer** block (often the heaviest weight among *promotional* lines). The **closest** line **directly under** that headline (same column, next line down) is **`subheadline_delivery_time`** when it is a **time / speed** fragment (e.g. «от 15 минут», "in 15 min") or **`subheadline`** otherwise. **Split** them: e.g. headline `"Доставим лекарства из аптек"` and **separate** child `subheadline_delivery_time` `"от 15 минут"` — **do not** merge both into one `headline` or one `subheadline_delivery_time` when the image shows **two** lines.
+5) **`legal_text` group:** if you include **any** nested child with role `legal_text`, its **`"text"` must be the full OCR** of **every** visible line in that disclaimer block (seller, address, ОГРН, tax lines, «…», age mark **0+**, etc.). Use newline `\\n` between lines as printed. **Never** `"text": ""` for that child when glyphs exist. Prefer **`"children": []`** only when you are sure there is no structured child needed — otherwise one child with full `text`.
+6) **`headline_group` / `subheadline_delivery_time` (legal vs marketing):** use `subheadline_delivery_time` **only** for a **short** marketing line tied to the hero offer (e.g. «привезёт курьер от 15 минут», «с доставкой от 15 мин», "Delivery in 15 min"). **Do not** put dense multi-line **regulatory / seller / partner / ОГРН** copy here — that entire block belongs under the top-level **`legal_text`** group (see rule 5).
+7) When rule 4 applies (a visible second line under the main headline), you **must** output **`subheadline_delivery_time`** (or `subheadline`) with non-empty **`text`** unless that line is **legal** micro-copy (then it belongs in **`legal_text`**, rule 5–6). Omitting a required marketing subline is an error.
 
 First classify:
 1. orientation
 2. zone_type
 
-Then detect ONLY these visual text groups:
+Then detect top-level text groups:
 - brand_group
 - headline_group
 - legal_text
 
-Use visual typography, size, weight, position, and hierarchy.
+Then detect inner children.
+
+For brand_group children (omit if not visible):
+- **brand_name_first** / **brand_name_second**: the **left** and **right** readable words when the brand is **two words with a mark between** (e.g. Яндекс … Лавка). **`text`** = the exact word string.
+- **logo**: bbox around the **symbol/icon cell between the two words** (circle + heart as **one** unit is usually one `logo`). **`"text"` is always `""`**.
+- **logo_back** + **logo_fore**: optional **split** of one physical badge — `logo_back` = plate/circle; `logo_fore` = **small graphic** on the plate (heart, arrow), **not** a second word. Both must use empty `"text"`. Prefer a single **`logo`** child unless the image clearly separates plate vs mark.
+- **brand_name**: one **single** contiguous brand word or fused logotype (e.g. "DOORDASH") when there is no two-word+mark layout.
+Include readable brand text in **`brand_name*`** only; never in `logo*`.
+
+For headline_group children (omit if not visible):
+- headline: **required** when headline_group exists — the **dominant campaign / offer** line(s): the main promise consumers read after the brand (e.g. pharmacy delivery, sale, product hook). **Not** the brand name row. **Multi-line hero offer** (e.g. three stacked lines like "GET 10" / "DELIVERIES" / "FOR $0" with the **same** visual weight, color, and hierarchy) is **one** `headline` child: one bbox wrapping **all** of those lines. A **separate** thinner line **immediately below** that block (e.g. «от 15 минут») is **`subheadline_delivery_time`**, not part of `headline` `text`.
+- subheadline_delivery_time: **short** marketing delivery promise next to the hero (speed, courier, minutes). Examples: "с доставкой от 15 минут", "**привезёт курьер от 15 минут**", "Hungry? Delivery is on Us." **Counter-example (wrong role):** multi-line blocks like **ДОСТАВКУ ОСУЩЕСТВЛЯЮТ ПАРТНЕРЫ… / ПРОДАВЕЦ — ООО… / ОГРН** — those are **`legal_text`**, not `subheadline_delivery_time`, even if the first line mentions доставку/партнёров.
+- subheadline_weight: weight/volume/pack/quantity (e.g. "1 кг", "400 г").
+- product_name: product name line (e.g. "Мандарины Абхазия").
+- subheadline_discount: discount/promo amount (e.g. "до 50%", "-52%").
+- subheadline: generic supporting line only when it is **not** delivery-, weight-, product-, or discount-specific.
+Use meaning from read text, not only position. Fill `"text"` with readable OCR for headline and sub-headline children whenever possible.
+
+For legal_text top-level group:
+- Either **`"children": []`** (rare — only when micro-copy is truly absent) **or** exactly **one** child with role `legal_text` whose **`"text"`** is the **complete** OCR of **all** disclaimer lines in the group's bbox (newline-separated). **Forbidden:** a `legal_text` child with `"text": ""` while disclaimer glyphs are visible.
+
+Allowed top-level group roles: brand_group, headline_group, legal_text.
+Allowed brand child roles: logo, logo_back, logo_fore, brand_name, brand_name_first, brand_name_second.
+Allowed headline child roles: headline, subheadline, subheadline_delivery_time, subheadline_weight, product_name, subheadline_discount.
+Use role "product_name" exactly (not subheadline_product_name).
+
+legal_text (top-level group) is **tiny dense** regulatory / fee / tax / seller / partner / eligibility disclaimer (often ALL CAPS or small caps, smallest font). It is **not** the main headline stack. **Short** emotional delivery hooks ("Hungry? Delivery is on Us.", «курьер от 15 мин») stay in **headline_group** as `subheadline_delivery_time`. **Partner/seller/address/ОГРН** stacks are **always** `legal_text`. The legal group bbox must cover **all** such micro-lines together (e.g. "$0 DELIVERY FEE…" through "…STILL APPLY." or full RU seller block).
+
+legal_text group is **mandatory for typical commercial / retail / delivery / promo banners**:
+- These creatives almost always include **footer micro-copy** (e.g. Реклама, ООО, ИНН, «…ограничено», legal disclaimers) in **the smallest font**, often along the **bottom edge** or **base of the text column** (left stack on split layouts).
+- **You must include a top-level legal_text group** with a bbox that tightly wraps **all** such lines whenever **any** disclaimer-sized text exists anywhere in the frame. **Scan the full width of the lower ~30–35%** of the image (and bottom corners) before returning JSON.
+- Do **not** skip legal_text because it is faint or low-contrast — it is still a text zone.
+- If you truly see **zero** micro-copy after careful inspection, omit legal_text (rare for real ads).
+
+Zone_type disambiguation (do not confuse these):
+- **left_text_right_image**: **Width ≥ height** (landscape or wide) and the layout is a **horizontal split**: a **left text column** (brand + headline + often legal at the bottom of that column) and a **right hero image / scene** filling the remainder. This is the common half-and-half **display ad**. **Do not** label this as upper_text_mid_image_lower_text.
+- **upper_image_lower_text**: A **large photo / scene / illustration** occupies the **upper** portion of the frame; **all** primary marketing copy (brand + headline + legal) sits **below** that image in **one** text stack. **Portrait** ads with **photo on top, blue/text block on bottom** are usually this — **not** `upper_text_mid_image_lower_text` unless there is a **separate text band above** the photo.
+- **upper_text_mid_image_lower_text**: Requires **three** clear **horizontal bands** in order: (**1**) **dedicated text strip at the very top** of the frame (headline/CTA **above** the hero image), (**2**) **hero image in the middle**, (**3**) **another text strip at the bottom** (e.g. footer). If there is **no** main copy strip **above** the hero — only image then text — use **upper_image_lower_text**.
+- **whole_text_no_image**: no dominant hero product photo; mostly type and background.
 
 Orientation rules:
 - wide: width / height >= 3.0
 - landscape: width > height and width / height < 3.0
 - portrait: height > width
 
-Allowed orientation values:
-landscape, wide, portrait
-
 Allowed zone_type values:
-left_text_right_image
-upper_image_lower_text
-whole_text_no_image
-upper_text_mid_image_lower_text
+left_text_right_image, upper_image_lower_text, whole_text_no_image, upper_text_mid_image_lower_text
 
-Zone type definitions:
-- left_text_right_image: main text/brand/offer is mostly on the left and the main product/person/image is mostly on the right. Use also for wide banners with this structure.
-- upper_image_lower_text: main image/photo is in the upper part and text/brand/offer/legal is in the lower part.
-- whole_text_no_image: mostly text on background and no main product/person/hero image. Decorative leaves/lights/sparkles do not count as main image.
-- upper_text_mid_image_lower_text: portrait layout where upper area has text/brand/price/headline, middle has main product/image, and lower has legal/badge/small text.
-
-Allowed text group roles:
-brand_group
-headline_group
-legal_text
-
-Definitions:
-brand_group = compact brand/logo identity block such as Яндекс Лавка, Яндекс Маркет, DoorDash, Золотое Яблоко. Usually smaller than headline and often near top or upper text area. Include logo mark + brand name as one bbox.
-headline_group = main promotional copy. Largest/boldest/dominant text. Can include subheadline or large price when it functions as the main offer. Do not create a separate price_group.
-legal_text = tiny dense legal/regulatory text, usually bottom or lower area, low visual priority. Do not confuse readable subheadline attached to the main message with legal_text.
-
-Zone-aware guidance:
-- left_text_right_image: brand_group and headline_group are usually in the left text area; legal_text often below them.
-- upper_image_lower_text: text groups are usually in the lower block; brand_group may start the lower block; headline_group is dominant lower text; legal_text near the bottom.
-- upper_text_mid_image_lower_text: brand_group and headline_group in the upper area; do not detect the middle product/image; legal_text in the lower area.
-- whole_text_no_image: detect brand_group, headline_group, legal_text if present.
-
-Return JSON only:
+Return JSON only (no markdown, no code fences). Include **three** top-level groups when brand, headline, and footer micro-copy are all present (typical ad):
 {
   "orientation": "...",
   "zone_type": "...",
@@ -308,38 +330,47 @@ Return JSON only:
         "role": "brand_group",
         "bbox": {"x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0},
         "confidence": 0.0,
-        "reason": "..."
+        "reason": "...",
+        "children": []
       },
       {
         "role": "headline_group",
         "bbox": {"x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0},
         "confidence": 0.0,
-        "reason": "..."
+        "reason": "...",
+        "children": []
       },
       {
         "role": "legal_text",
         "bbox": {"x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0},
         "confidence": 0.0,
-        "reason": "..."
+        "reason": "Footer disclaimer / INN / ООО",
+        "children": []
       }
     ]
   }
 }
 
 Rules:
-- Return JSON only.
-- Do not wrap the JSON in markdown code fences (no ```).
-- Do not output markdown.
-- Do not invent extra roles.
-- Do not output logo_group.
-- Do not detect product/person/image/background/decoration.
-- Omit absent groups.
-- Bboxes must be normalized from 0.0 to 1.0 relative to the full image (x=left/w, y=top/h, width=box_w/w, height=box_h/h).
-- Each bbox must be a JSON object with exactly these numeric keys: "x", "y", "width", "height". Do not use arrays. Do not write bare numbers after "x": without "y"/"width"/"height" key names.
-- Bboxes should tightly cover only the visual text group; do not include hero/product/image areas inside text group bboxes.
-- Use typography hierarchy: largest/boldest main message is headline_group; compact brand identity is brand_group; tiny dense disclaimer is legal_text.
+- Return JSON only. No ``` fences.
+- Output one fully closed JSON object (balanced braces/brackets). Do not stop mid-JSON.
+- Do not output logo_group (use brand_group).
+- Do not invent roles outside the allowed lists.
+- Do not analyze product/person/hero image/background/decorations.
+- Each bbox: object with "x","y","width","height" (0..1 relative to full banner). No bare numbers after "x": without keys.
+- **"text" field (OCR / transcription):** `logo` / `logo_back` / `logo_fore` → **`"text"` always `""`**. For **every other** child you **must** set `"text"` to the **exact readable string** from the image (Unicode as printed). That includes **`legal_text` nested under the `legal_text` group** (full disclaimer), plus `brand_name*`, `headline`, all `subheadline*` roles, and `product_name`. **Never use `"text": ""`** on those when the words are visible. **Bad examples:** `"headline": { ..., "text": "" }` while readable; **`legal_text` child with empty `text`** while the footer is visible; **`logo` with `"text": "Яндекс"`** — wrong role, use `brand_name_first`.
+- Omit absent **children** inside groups when not visible. For top-level groups: **always include brand_group, headline_group, and legal_text** whenever those regions exist; **legal_text is almost never absent** on real commercial banners.
+- Keep each "reason" string short (about one line). For **legal_text** group: use **`children: []`** or **one** child with **full** disclaimer text — do not add a placeholder child with empty `text`.
 
-The orientation value must match width and height of the image pixels using the orientation rules above.
+**Final checklist before you output JSON:**
+0) **zone_type:** image-on-top + single text stack below (portrait DM) → **`upper_image_lower_text`** unless a real **text band sits above** the photo (then `upper_text_mid_image_lower_text`).
+1) Two-word brand with mark between (Яндекс … Лавка): **`brand_name_first`** + **`logo`** (`text` **empty**) + **`brand_name_second`**; words **only** in `brand_name_*`, never on `logo` / `logo_fore` / `logo_back`. Single-word brand: one `brand_name` or `logo`+`brand_name` as appropriate. **Do not** repeat those words as `headline`.
+1b) `brand_name` / `brand_name_*`: `"text"` = exact string (e.g. DOORDASH, Яндекс, Лавка).
+2) `headline`: **offer only** — `"text"` = main promise (e.g. «Доставим лекарства из аптек»); multi-line **same-weight** offer = one `headline` with one bbox (e.g. GET 10 + DELIVERIES + FOR $0).
+3) **Mandatory** when visible: the **next line down** under that offer (e.g. «от 15 минут») → **`subheadline_delivery_time`** with its **own** bbox and non-empty `"text"` (CRITICAL headline stacking, rule 4).
+4) Footer / seller / partner / ОГРН block: top-level `legal_text` group bbox wraps **all** micro-lines; nested `legal_text` child's `"text"` = **full** OCR (newlines as printed). **Never** empty `text` for that child when the block exists.
+
+The orientation value must match image pixel dimensions using the orientation rules above.
 """.strip()
 
 
@@ -392,6 +423,13 @@ def _clamp_norm_bbox_dict(x: float, y: float, w: float, h: float) -> dict[str, f
     return {"x": x, "y": y, "width": w, "height": h}
 
 
+def _scale_bbox_component_if_pixel(val: float, denom: int) -> float:
+    """VLM often mixes pixel x,y with 0–1 width,height; only divide values clearly in pixel range."""
+    if val > 1.0:
+        return val / float(max(1, denom))
+    return val
+
+
 def _finalize_normalized_bbox(
     b: Any,
     pixel_w: int,
@@ -399,7 +437,8 @@ def _finalize_normalized_bbox(
 ) -> dict[str, float] | None:
     """
     Normalize bbox to 0..1. Accepts dict {x,y,width,height} or 4-number list/tuple.
-    If any coordinate magnitude suggests pixels (max > 1), convert using pixel_w x pixel_h.
+    Per-field pixel detection: only components > 1.0 are divided by pixel_w or pixel_h
+    (avoids destroying already-normalized width/height when x,y are in pixels).
     For lists in pixel space, values are treated as x1,y1,x2,y2 (two corners).
     For dicts in pixel space, values are x,y,width,height.
     """
@@ -413,12 +452,20 @@ def _finalize_normalized_bbox(
         a, c, d, e = float(fv[0]), float(fv[1]), float(fv[2]), float(fv[3])
         if max(a, c, d, e) > 1.0:
             if d > a and e > c and (d - a) <= pw * 1.02 and (e - c) <= ph * 1.02:
-                x_px, y_px, w_px, h_px = a, c, d - a, e - c
+                x_px, y_px, x2_px, y2_px = a, c, d, e
+                x_px = _scale_bbox_component_if_pixel(x_px, pw)
+                x2_px = _scale_bbox_component_if_pixel(x2_px, pw)
+                y_px = _scale_bbox_component_if_pixel(y_px, ph)
+                y2_px = _scale_bbox_component_if_pixel(y2_px, ph)
+                w_px, h_px = x2_px - x_px, y2_px - y_px
             else:
-                x_px, y_px, w_px, h_px = a, c, d, e
+                x_px = _scale_bbox_component_if_pixel(a, pw)
+                y_px = _scale_bbox_component_if_pixel(c, ph)
+                w_px = _scale_bbox_component_if_pixel(d, pw)
+                h_px = _scale_bbox_component_if_pixel(e, ph)
             if w_px <= 0 or h_px <= 0:
                 return None
-            x, y, w, h = x_px / pw, y_px / ph, w_px / pw, h_px / ph
+            x, y, w, h = x_px, y_px, w_px, h_px
         else:
             x, y, w, h = a, c, d, e
         return _clamp_norm_bbox_dict(x, y, w, h)
@@ -431,8 +478,10 @@ def _finalize_normalized_bbox(
     h = _coerce_float01(b.get("height"))
     if x is None or y is None or w is None or h is None:
         return None
-    if max(x, y, w, h) > 1.0:
-        x, y, w, h = x / float(pw), y / float(ph), w / float(pw), h / float(ph)
+    x = _scale_bbox_component_if_pixel(float(x), pw)
+    y = _scale_bbox_component_if_pixel(float(y), ph)
+    w = _scale_bbox_component_if_pixel(float(w), pw)
+    h = _scale_bbox_component_if_pixel(float(h), ph)
     return _clamp_norm_bbox_dict(x, y, w, h)
 
 
@@ -469,6 +518,311 @@ def _dedupe_text_zone_groups_by_role(
     return [by_role[r] for r in order if r in by_role]
 
 
+_TEXT_ZONE_BRAND_CHILD_ROLES = frozenset(
+    {
+        "logo",
+        "logo_back",
+        "logo_fore",
+        "brand_name",
+        "brand_name_first",
+        "brand_name_second",
+    },
+)
+_TEXT_ZONE_HEADLINE_CHILD_ROLES = frozenset(
+    {
+        "headline",
+        "subheadline",
+        "subheadline_delivery_time",
+        "subheadline_weight",
+        "product_name",
+        "subheadline_discount",
+    },
+)
+_TEXT_ZONE_LEGAL_CHILD_ROLES = frozenset({"legal_text"})
+_TEXT_ZONE_LOGO_CHILD_ROLES = frozenset({"logo", "logo_back", "logo_fore"})
+_TEXT_ZONE_CHILD_TEXT_MAX_CHARS = 8000
+_TEXT_ZONE_CHILD_ROLE_ALIASES = {
+    "subheadlne_product_name": "product_name",
+    "subheadine_product_name": "product_name",
+    "subheadline_delivery": "subheadline_delivery_time",
+}
+
+
+def _canonical_text_zone_child_role(role_raw: str) -> str:
+    s = (role_raw or "").strip()
+    return _TEXT_ZONE_CHILD_ROLE_ALIASES.get(s, s)
+
+
+def _allowed_child_roles_for_parent(parent_role: str) -> frozenset[str]:
+    if parent_role == "brand_group":
+        return _TEXT_ZONE_BRAND_CHILD_ROLES
+    if parent_role == "headline_group":
+        return _TEXT_ZONE_HEADLINE_CHILD_ROLES
+    if parent_role == "legal_text":
+        return _TEXT_ZONE_LEGAL_CHILD_ROLES
+    return frozenset()
+
+
+def _child_role_sort_index(parent_role: str, child_role: str) -> int:
+    if parent_role == "brand_group":
+        order = (
+            "logo",
+            "logo_back",
+            "logo_fore",
+            "brand_name",
+            "brand_name_first",
+            "brand_name_second",
+        )
+    elif parent_role == "headline_group":
+        order = (
+            "headline",
+            "subheadline",
+            "subheadline_delivery_time",
+            "subheadline_weight",
+            "product_name",
+            "subheadline_discount",
+        )
+    else:
+        order = ("legal_text",)
+    try:
+        return order.index(child_role)
+    except ValueError:
+        return 999
+
+
+def _dedupe_text_zone_children_by_role(
+    children: list[dict[str, Any]],
+    warnings: list[str],
+    *,
+    parent_role: str,
+) -> list[dict[str, Any]]:
+    by_role: dict[str, dict[str, Any]] = {}
+    for c in children:
+        role = str(c.get("role", "") or "")
+        try:
+            cf = float(c.get("confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            cf = 0.0
+        prev = by_role.get(role)
+        if prev is None:
+            by_role[role] = c
+            continue
+        try:
+            pcf = float(prev.get("confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            pcf = 0.0
+        if cf > pcf:
+            warnings.append(
+                f"{parent_role} duplicate child role={role!r}: kept higher confidence ({cf:.4f} vs {pcf:.4f})",
+            )
+            by_role[role] = c
+        else:
+            warnings.append(
+                f"{parent_role} duplicate child role={role!r}: dropped lower confidence ({cf:.4f} vs kept {pcf:.4f})",
+            )
+    return sorted(by_role.values(), key=lambda d: _child_role_sort_index(parent_role, str(d.get("role", ""))))
+
+
+def _infer_child_text_from_reason(reason: str) -> str:
+    """
+    When the VLM leaves \"text\" empty but echoes copy inside \"reason\" (e.g. Brand name 'Яндекс'.),
+    recover the substring so clients get usable OCR. Best-effort; does not replace a real model fix.
+    """
+    s = (reason or "").strip()
+    if len(s) < 3:
+        return ""
+    cap = str(_TEXT_ZONE_CHILD_TEXT_MAX_CHARS)
+    patterns = (
+        rf"«([^»]{{2,{cap}}})»",
+        rf"[\u201c\u201e]([^\u201d]{{2,{cap}}})[\u201d]",  # “…”
+        rf'"([^"]{{2,{cap}}})"',
+        rf"'([^']{{2,{cap}}})'",
+    )
+    for pat in patterns:
+        m = re.search(pat, s)
+        if m:
+            t = (m.group(1) or "").strip()
+            if len(t) >= 2:
+                return t[:_TEXT_ZONE_CHILD_TEXT_MAX_CHARS]
+    return ""
+
+
+def _child_text_may_be_empty_for_visual(parent_role: str, child_role: str) -> bool:
+    return (child_role or "").strip() in _TEXT_ZONE_LOGO_CHILD_ROLES
+
+
+def _finalize_text_zone_children(
+    parent_role: str,
+    raw_children: Any,
+    warnings: list[str],
+    *,
+    pixel_w: int,
+    pixel_h: int,
+) -> list[dict[str, Any]]:
+    allowed = _allowed_child_roles_for_parent(parent_role)
+    if not allowed:
+        return []
+    if raw_children is None:
+        return []
+    if not isinstance(raw_children, list):
+        warnings.append(f"text_zone.groups role={parent_role!r}: children is not a list; ignored")
+        return []
+    out: list[dict[str, Any]] = []
+    for j, ch in enumerate(raw_children):
+        if not isinstance(ch, dict):
+            continue
+        rraw = str(ch.get("role", "") or "").strip()
+        rcanon = _canonical_text_zone_child_role(rraw)
+        if rcanon != rraw and rraw:
+            warnings.append(f"{parent_role} children[{j}]: role {rraw!r} normalized to {rcanon!r}")
+        if rcanon not in allowed:
+            warnings.append(f"{parent_role} children[{j}]: dropped invalid role={rraw!r}")
+            continue
+        bbox = _finalize_normalized_bbox(ch.get("bbox"), pixel_w, pixel_h)
+        if bbox is None:
+            warnings.append(f"{parent_role} children[{j}] role={rcanon!r}: invalid bbox")
+            continue
+        try:
+            cc = float(ch.get("confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            cc = 0.0
+        cr = str(ch.get("reason", "") or "")
+        txt = ch.get("text")
+        if txt is None:
+            tstr = ""
+        else:
+            tstr = str(txt).strip()
+            if len(tstr) > _TEXT_ZONE_CHILD_TEXT_MAX_CHARS:
+                tstr = tstr[:_TEXT_ZONE_CHILD_TEXT_MAX_CHARS]
+                warnings.append(
+                    f"{parent_role} children[{j}] role={rcanon!r}: text truncated to "
+                    f"{_TEXT_ZONE_CHILD_TEXT_MAX_CHARS} chars",
+                )
+        if not tstr and rcanon not in _TEXT_ZONE_LOGO_CHILD_ROLES:
+            inferred = _infer_child_text_from_reason(cr)
+            if inferred:
+                tstr = inferred
+                warnings.append(
+                    f"{parent_role} children[{j}] role={rcanon!r}: filled \"text\" from quoted snippet in "
+                    f"\"reason\" (model should still emit text directly in JSON).",
+                )
+        if rcanon in _TEXT_ZONE_LOGO_CHILD_ROLES and tstr:
+            warnings.append(
+                f"{parent_role} children[{j}] role={rcanon!r}: cleared non-empty \"text\" ({tstr[:80]!r}…) — "
+                f"logo/logo_back/logo_fore must use empty \"text\"; put words in brand_name / brand_name_first / "
+                f"brand_name_second.",
+            )
+            tstr = ""
+        if not _child_text_may_be_empty_for_visual(parent_role, rcanon) and not tstr:
+            warnings.append(
+                f"{parent_role} children[{j}] role={rcanon!r}: empty \"text\" — transcribe visible copy "
+                f"(required except logo, logo_back, logo_fore).",
+            )
+        out.append(
+            {
+                "role": rcanon,
+                "text": tstr,
+                "bbox": bbox,
+                "confidence": cc,
+                "reason": cr,
+            }
+        )
+    return _dedupe_text_zone_children_by_role(out, warnings, parent_role=parent_role)
+
+
+def _warn_brand_group_missing_word_children(groups: list[dict[str, Any]], warnings: list[str]) -> None:
+    word_roles = frozenset({"brand_name", "brand_name_first", "brand_name_second"})
+    for g in groups:
+        if str(g.get("role", "") or "") != "brand_group":
+            continue
+        ch = g.get("children")
+        if not isinstance(ch, list) or not ch:
+            continue
+        roles = {str(c.get("role", "") or "") for c in ch if isinstance(c, dict)}
+        if roles & _TEXT_ZONE_LOGO_CHILD_ROLES and not (roles & word_roles):
+            warnings.append(
+                "brand_group has logo/logo_back/logo_fore but no brand_name / brand_name_first / "
+                "brand_name_second; for «Word [mark] Word» layouts emit brand_name_first + logo (empty text) + "
+                "brand_name_second.",
+            )
+
+
+def _warn_headline_group_missing_headline_child(groups: list[dict[str, Any]], warnings: list[str]) -> None:
+    for g in groups:
+        if str(g.get("role", "") or "") != "headline_group":
+            continue
+        ch = g.get("children")
+        if not isinstance(ch, list):
+            warnings.append(
+                "headline_group: children is not a list; expected a headline child when headline_group exists.",
+            )
+            continue
+        roles = {str(c.get("role", "") or "") for c in ch if isinstance(c, dict)}
+        if "headline" not in roles:
+            warnings.append(
+                "headline_group present but no child with role headline; model should include headline when group exists.",
+            )
+
+
+def _warn_missing_legal_text_top_level(groups: list[dict[str, Any]], warnings: list[str]) -> None:
+    roles = {str(g.get("role", "") or "") for g in groups}
+    if "legal_text" not in roles:
+        warnings.append(
+            "No legal_text top-level group. Commercial banners normally include disclaimer/footer micro-copy "
+            "(e.g. Реклама, ООО, ИНН) — re-check the bottom ~35% of the canvas and lower corners.",
+        )
+
+
+def _warn_headline_group_missing_subheadline_support(groups: list[dict[str, Any]], warnings: list[str]) -> None:
+    """Heuristic: vertical gap inside headline_group under headline child ⇒ add subheadline + text."""
+    support_roles = frozenset(
+        {
+            "subheadline",
+            "subheadline_delivery_time",
+            "subheadline_weight",
+            "product_name",
+            "subheadline_discount",
+        },
+    )
+    for g in groups:
+        if str(g.get("role", "") or "") != "headline_group":
+            continue
+        ch = g.get("children")
+        if not isinstance(ch, list):
+            continue
+        roles = {str(c.get("role", "") or "").strip() for c in ch if isinstance(c, dict)}
+        if roles & support_roles:
+            continue
+        if "headline" not in roles:
+            continue
+        headline_child: dict[str, Any] | None = None
+        for c in ch:
+            if isinstance(c, dict) and str(c.get("role", "") or "").strip() == "headline":
+                headline_child = c
+                break
+        if headline_child is None:
+            continue
+        gb = g.get("bbox")
+        hb = headline_child.get("bbox")
+        if not isinstance(gb, dict) or not isinstance(hb, dict):
+            continue
+        try:
+            gy = float(gb.get("y", 0) or 0)
+            gh = float(gb.get("height", 0) or 0)
+            hy = float(hb.get("y", 0) or 0)
+            hh = float(hb.get("height", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        bottom_g = gy + gh
+        bottom_h = hy + hh
+        gap = bottom_g - bottom_h
+        if gap > 0.06:
+            warnings.append(
+                "headline_group extends noticeably below the headline child bbox; likely missing a "
+                "subheadline (e.g. subheadline_delivery_time) with non-empty \"text\" under the main offer.",
+            )
+
+
 def _finalize_text_zone_groups(
     raw: Any,
     warnings: list[str],
@@ -503,15 +857,22 @@ def _finalize_text_zone_groups(
         except (TypeError, ValueError):
             gc = 0.0
         gr = str(item.get("reason", "") or "")
+        children = _finalize_text_zone_children(role, item.get("children"), warnings, pixel_w=pixel_w, pixel_h=pixel_h)
         out.append(
             {
                 "role": role,
                 "bbox": bbox,
                 "confidence": gc,
                 "reason": gr,
+                "children": children,
             }
         )
-    return _dedupe_text_zone_groups_by_role(out, warnings)
+    deduped = _dedupe_text_zone_groups_by_role(out, warnings)
+    _warn_headline_group_missing_headline_child(deduped, warnings)
+    _warn_missing_legal_text_top_level(deduped, warnings)
+    _warn_headline_group_missing_subheadline_support(deduped, warnings)
+    _warn_brand_group_missing_word_children(deduped, warnings)
+    return deduped
 
 
 def _slugify_machine_brand(value: str) -> str:
@@ -1577,20 +1938,29 @@ Return JSON only:
 
         det_orientation = _deterministic_orientation_from_dims(ow, oh)
         prompt = _build_analyze_text_zone_visual_prompt()
+        mtokens = min(
+            max(ANALYZE_TEXT_ZONE_VISUAL_MIN_NEW_TOKENS, int(self.max_new_tokens)),
+            ANALYZE_TEXT_ZONE_VISUAL_MAX_NEW_TOKENS_CAP,
+        )
+        logger.info("analyze_text_zone_visual: max_new_tokens=%d", mtokens)
         t0 = time.perf_counter()
         raw_output = self._run_model(
             [image],
             prompt,
-            max_new_tokens=min(int(self.max_new_tokens), 768),
+            max_new_tokens=mtokens,
         )
         qwen_elapsed = time.perf_counter() - t0
         logger.info("analyze_text_zone_visual: qwen_elapsed_seconds=%.4f", qwen_elapsed)
 
+        raw_len = len(raw_output or "")
+        logger.info("analyze_text_zone_visual: raw_model_output_chars=%d", raw_len)
         data = self._extract_json(raw_output)
         if not isinstance(data, dict):
+            tail = (raw_output or "")[-400:].replace("\n", "\\n")
             logger.warning(
-                "analyze_text_zone_visual: invalid JSON from model raw_len=%d",
-                len(raw_output or ""),
+                "analyze_text_zone_visual: invalid JSON from model raw_len=%d tail=%r",
+                raw_len,
+                tail,
             )
             raise ClassifyZoneUnparseableModelOutput(raw_output or "")
 
@@ -1627,23 +1997,38 @@ Return JSON only:
         tz_raw = data.get("text_zone")
         groups_out = _finalize_text_zone_groups(tz_raw, warnings, pixel_w=fw, pixel_h=fh)
 
+        child_counts = [
+            len(g["children"]) if isinstance(g.get("children"), list) else 0 for g in groups_out
+        ]
         logger.info(
             "analyze_text_zone_visual: endpoint=POST/analyze-text-zone-visual orientation=%r "
-            "zone_type=%r text_zone_group_count=%d warnings=%d",
+            "zone_type=%r text_zone_group_count=%d child_counts_per_group=%s warnings=%d",
             ori,
             zt,
             len(groups_out),
+            child_counts,
             len(warnings),
         )
         if warnings:
             logger.info("analyze_text_zone_visual: validation_warnings=%s", warnings)
         for g in groups_out:
+            ch = g.get("children") if isinstance(g.get("children"), list) else []
             logger.info(
-                "analyze_text_zone_visual: group role=%r confidence=%.4f bbox=%s",
+                "analyze_text_zone_visual: group role=%r confidence=%.4f bbox=%s child_count=%d",
                 g.get("role"),
                 float(g.get("confidence", 0.0) or 0.0),
                 g.get("bbox"),
+                len(ch),
             )
+            for c in ch:
+                if not isinstance(c, dict):
+                    continue
+                logger.info(
+                    "analyze_text_zone_visual:   child role=%r confidence=%.4f bbox=%s",
+                    c.get("role"),
+                    float(c.get("confidence", 0.0) or 0.0),
+                    c.get("bbox"),
+                )
 
         return {
             "orientation": ori,

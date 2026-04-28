@@ -4,6 +4,22 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+TextZoneChildRole = Literal[
+    "logo",
+    "logo_back",
+    "logo_fore",
+    "brand_name",
+    "brand_name_first",
+    "brand_name_second",
+    "headline",
+    "subheadline",
+    "subheadline_delivery_time",
+    "subheadline_weight",
+    "product_name",
+    "subheadline_discount",
+    "legal_text",
+]
+
 
 class ClassifyZonePluginRequest(BaseModel):
     """Figma plugin: same transport as ``/api/convert`` (strict PNG base64, no multipart)."""
@@ -45,11 +61,22 @@ class NormalizedBbox(BaseModel):
     height: float = Field(gt=0.0, le=1.0)
 
 
+class TextZoneChildItem(BaseModel):
+    """Visual sub-part inside ``brand_group`` or ``headline_group`` (or optional ``legal_text`` child)."""
+
+    role: TextZoneChildRole
+    text: str = ""
+    bbox: NormalizedBbox
+    confidence: float = 0.0
+    reason: str = ""
+
+
 class TextZoneGroupItem(BaseModel):
     role: Literal["brand_group", "headline_group", "legal_text"]
     bbox: NormalizedBbox
     confidence: float = 0.0
     reason: str = ""
+    children: list[TextZoneChildItem] = Field(default_factory=list)
 
 
 class TextZoneVisual(BaseModel):
