@@ -12,8 +12,15 @@ ZONE_TYPES: frozenset[str] = frozenset(
 ORIENTATIONS: frozenset[str] = frozenset({"landscape", "wide", "portrait"})
 
 TEXT_ZONE_GROUP_ROLES: frozenset[str] = frozenset(
-    {"brand_group", "headline_group", "legal_text"},
+    {"brand_group", "headline_group", "age_badge_group", "legal_text_group"},
 )
+
+# Top-level group JSON may use legacy names; normalize before validation.
+TEXT_ZONE_LEGACY_GROUP_ALIASES: dict[str, str] = {
+    "logo_group": "brand_group",
+    "age_badge": "age_badge_group",
+    "legal_text": "legal_text_group",
+}
 
 TEXT_ZONE_BRAND_CHILD_ROLES: frozenset[str] = frozenset(
     {
@@ -38,6 +45,8 @@ TEXT_ZONE_HEADLINE_CHILD_ROLES: frozenset[str] = frozenset(
 )
 
 TEXT_ZONE_LEGAL_CHILD_ROLES: frozenset[str] = frozenset({"legal_text"})
+
+TEXT_ZONE_AGE_BADGE_CHILD_ROLES: frozenset[str] = frozenset({"age_badge"})
 
 TEXT_ZONE_LOGO_CHILD_ROLES: frozenset[str] = frozenset({"logo", "logo_back", "logo_fore"})
 
@@ -67,8 +76,10 @@ def is_allowed_text_zone_child_for_parent(parent_role: str, child_role_raw: str)
         return c in TEXT_ZONE_BRAND_CHILD_ROLES
     if parent_role == "headline_group":
         return c in TEXT_ZONE_HEADLINE_CHILD_ROLES
-    if parent_role == "legal_text":
+    if parent_role == "legal_text_group":
         return c in TEXT_ZONE_LEGAL_CHILD_ROLES
+    if parent_role == "age_badge_group":
+        return c in TEXT_ZONE_AGE_BADGE_CHILD_ROLES
     return False
 
 
@@ -91,8 +102,12 @@ def text_zone_child_sort_key(parent_role: str, child_role: str) -> int:
             "product_name",
             "subheadline_discount",
         )
-    else:
+    elif parent_role == "legal_text_group":
         order = ("legal_text",)
+    elif parent_role == "age_badge_group":
+        order = ("age_badge",)
+    else:
+        order = ()
     try:
         return order.index(child_role)
     except ValueError:
@@ -123,6 +138,10 @@ def is_allowed_orientation(value: str) -> bool:
     return s in ORIENTATIONS
 
 
+def canonical_text_zone_group_role(role_raw: str) -> str:
+    s = (role_raw or "").strip()
+    return TEXT_ZONE_LEGACY_GROUP_ALIASES.get(s, s)
+
+
 def is_allowed_text_zone_role(value: str) -> bool:
-    s = (value or "").strip()
-    return s in TEXT_ZONE_GROUP_ROLES
+    return canonical_text_zone_group_role((value or "").strip()) in TEXT_ZONE_GROUP_ROLES

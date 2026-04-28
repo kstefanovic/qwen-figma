@@ -18,6 +18,7 @@ TextZoneChildRole = Literal[
     "product_name",
     "subheadline_discount",
     "legal_text",
+    "age_badge",
 ]
 
 
@@ -62,7 +63,7 @@ class NormalizedBbox(BaseModel):
 
 
 class TextZoneChildItem(BaseModel):
-    """Visual sub-part inside ``brand_group`` or ``headline_group`` (or optional ``legal_text`` child)."""
+    """Visual sub-part inside a text-zone group (brand, headline, legal, or age_badge)."""
 
     role: TextZoneChildRole
     text: str = ""
@@ -72,7 +73,7 @@ class TextZoneChildItem(BaseModel):
 
 
 class TextZoneGroupItem(BaseModel):
-    role: Literal["brand_group", "headline_group", "legal_text"]
+    role: Literal["brand_group", "headline_group", "age_badge_group", "legal_text_group"]
     bbox: NormalizedBbox
     confidence: float = 0.0
     reason: str = ""

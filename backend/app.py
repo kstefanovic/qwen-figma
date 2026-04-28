@@ -415,7 +415,7 @@ async def analyze_text_zone_visual_v2(
     banner_png: UploadFile = File(..., description="Banner raster (PNG/JPEG/WebP)."),
 ) -> AnalyzeTextZoneVisualResponse:
     """
-    v2: banner.png only — orientation, zone_type, and text_zone.groups (normalized bboxes).
+    v2: banner.png only — orientation, zone_type, and text_zone.groups (brand_group, headline_group, optional age_badge, legal_text; normalized bboxes).
     No raw JSON, atlas, or Figma node mapping.
     """
     if not banner_png.filename:

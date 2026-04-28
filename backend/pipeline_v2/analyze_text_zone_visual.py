@@ -8,6 +8,8 @@ from typing import Any
 
 from env_load import default_qwen_base_url
 
+from backend.text_zone_age_badge_guard import should_strip_age_badge_group_vs_brand
+
 from backend.pipeline_v2.image_utils import decode_banner_raster, resize_and_encode_for_zone_qwen
 from backend.pipeline_v2.schemas import (
     AnalyzeTextZoneVisualDebug,
@@ -21,6 +23,7 @@ from backend.pipeline_v2.zone_types import (
     TEXT_ZONE_CHILD_TEXT_MAX_CHARS,
     TEXT_ZONE_LOGO_CHILD_ROLES,
     canonical_text_zone_child_role,
+    canonical_text_zone_group_role,
     deterministic_orientation,
     is_allowed_orientation,
     is_allowed_text_zone_child_for_parent,
@@ -155,13 +158,13 @@ def _coerce_confidence(v: Any) -> float:
 
 
 def _normalize_text_zone_group_role(role: str, warnings: list[str], idx: int) -> str | None:
-    s = (role or "").strip()
-    if s == "logo_group":
-        warnings.append(f"groups[{idx}]: role logo_group normalized to brand_group")
-        s = "brand_group"
-    if is_allowed_text_zone_role(s):
-        return s
-    return None
+    raw = (role or "").strip()
+    s = canonical_text_zone_group_role(raw)
+    if raw != s:
+        warnings.append(f"groups[{idx}]: role {raw!r} normalized to {s!r}")
+    if not is_allowed_text_zone_role(s):
+        return None
+    return s
 
 
 def _dedupe_child_items(
@@ -300,11 +303,31 @@ def _warn_missing_legal_text_top_level(
     warnings: list[str],
 ) -> None:
     roles = {g.role for g in groups}
-    if "legal_text" not in roles:
+    if "legal_text_group" not in roles:
         warnings.append(
-            "No legal_text top-level group. Commercial banners normally include disclaimer/footer micro-copy "
+            "No legal_text_group top-level group. Commercial banners normally include disclaimer/footer micro-copy "
             "(e.g. Реклама, ООО, ИНН) — re-check the bottom ~35% of the canvas and lower corners.",
         )
+
+
+def _warn_age_badge_group_incomplete(
+    groups: list[TextZoneGroupItem],
+    warnings: list[str],
+) -> None:
+    for g in groups:
+        if g.role != "age_badge_group":
+            continue
+        if not g.children:
+            warnings.append(
+                "age_badge_group present but children missing or empty; add one child role age_badge with "
+                "text like \"0+\" and a tight bbox.",
+            )
+            continue
+        if not any(c.role == "age_badge" and (c.text or "").strip() for c in g.children):
+            warnings.append(
+                "age_badge_group present but no child with role age_badge and non-empty text; transcribe the "
+                "badge (e.g. 0+).",
+            )
 
 
 def _warn_headline_group_missing_subheadline_support(
@@ -342,6 +365,32 @@ def _warn_headline_group_missing_subheadline_support(
             )
 
 
+def _maybe_strip_hallucinated_age_badge_on_brand_row(
+    groups: list[TextZoneGroupItem],
+    warnings: list[str],
+) -> None:
+    brand_bbox = next((g.bbox for g in groups if g.role == "brand_group"), None)
+    if brand_bbox is None:
+        return
+    drop = False
+    for g in groups:
+        if g.role != "age_badge_group":
+            continue
+        for c in g.children:
+            if c.role == "age_badge" and should_strip_age_badge_group_vs_brand(brand_bbox, c.bbox):
+                drop = True
+                break
+        if drop:
+            break
+    if not drop:
+        return
+    warnings.append(
+        "Removed age_badge_group: age_badge bbox matches the brand row size/placement "
+        "(likely hallucinated N+; real marks are usually a much smaller plate elsewhere).",
+    )
+    groups[:] = [g for g in groups if g.role != "age_badge_group"]
+
+
 def _dedupe_text_zone_group_items(
     items: list[TextZoneGroupItem],
     warnings: list[str],
@@ -362,7 +411,7 @@ def _dedupe_text_zone_group_items(
             warnings.append(
                 f"duplicate role={g.role!r}: dropped lower confidence ({g.confidence:.4f} vs kept {prev.confidence:.4f})",
             )
-    order = ("brand_group", "headline_group", "legal_text")
+    order = ("brand_group", "headline_group", "age_badge_group", "legal_text_group")
     return [by_role[r] for r in order if r in by_role]
 
 
@@ -404,6 +453,13 @@ def analyze_text_zone_visual_from_banner_bytes(
     data = annotator.analyze_text_zone_visual_from_banner(prepared_bytes)
     qwen_elapsed = time.perf_counter() - t0
     timings["qwen_elapsed_seconds"] = qwen_elapsed
+    qwen_call_count = 1
+    dbg = data.get("debug")
+    if isinstance(dbg, dict):
+        try:
+            qwen_call_count = max(1, int(dbg.get("qwen_call_count") or 1))
+        except (TypeError, ValueError):
+            qwen_call_count = 1
 
     t0 = time.perf_counter()
     zone_type = str(data.get("zone_type", "") or "").strip()
@@ -469,10 +525,12 @@ def analyze_text_zone_visual_from_banner_bytes(
         )
 
     groups_out = _dedupe_text_zone_group_items(groups_out, warnings)
+    _maybe_strip_hallucinated_age_badge_on_brand_row(groups_out, warnings)
     _warn_headline_group_missing_headline(groups_out, warnings)
     _warn_missing_legal_text_top_level(groups_out, warnings)
     _warn_headline_group_missing_subheadline_support(groups_out, warnings)
     _warn_brand_group_missing_word_children(groups_out, warnings)
+    _warn_age_badge_group_incomplete(groups_out, warnings)
 
     timings["parse_qwen_json"] = time.perf_counter() - t0
     timings["total"] = time.perf_counter() - t_total0
@@ -525,7 +583,7 @@ def analyze_text_zone_visual_from_banner_bytes(
         reason=reason,
         text_zone=TextZoneVisual(groups=groups_out),
         debug=AnalyzeTextZoneVisualDebug(
-            qwen_call_count=1,
+            qwen_call_count=qwen_call_count,
             elapsed_seconds=round(timings["total"], 4),
             validation_warnings=warnings,
         ),

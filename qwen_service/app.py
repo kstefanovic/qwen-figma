@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import math
+import os
 import re
 import sys
 import time
@@ -37,6 +38,13 @@ from qwen_service.schemas import (
     SemanticStructureAnnotateRequest,
     ZoneClassifyRequest,
 )
+
+try:
+    from backend.text_zone_age_badge_guard import should_strip_age_badge_group_vs_brand
+except ImportError:  # pragma: no cover — minimal deployments without backend package on PYTHONPATH
+
+    def should_strip_age_badge_group_vs_brand(brand_bbox: Any, age_child_bbox: Any) -> bool:  # type: ignore[misc]
+        return False
 
 try:
     import torch
@@ -172,6 +180,12 @@ CLASSIFY_ZONE_V2_MAX_LONG_SIDE = 1280
 # Nested text_zone.groups + children needs a higher ceiling than short classify-zone JSON.
 ANALYZE_TEXT_ZONE_VISUAL_MIN_NEW_TOKENS = 3072
 ANALYZE_TEXT_ZONE_VISUAL_MAX_NEW_TOKENS_CAP = 8192
+# Focused second VLM pass when the main text_zone JSON omitted ``age_badge`` (common for 0+ on hero photo).
+AGE_BADGE_AUX_MAX_NEW_TOKENS = 384
+# Second pass when the main JSON omitted footer / disclaimer micro-copy (dense legal block).
+LEGAL_TEXT_AUX_MAX_NEW_TOKENS = 3072
+# Second pass when the main JSON has headline but omitted a short delivery-speed line under it.
+DELIVERY_SUBLINE_AUX_MAX_NEW_TOKENS = 512
 
 _CLASSIFY_ZONE_V2_ORIENTATIONS = frozenset({"landscape", "wide", "portrait"})
 _CLASSIFY_ZONE_V2_ZONE_TYPES = frozenset(
@@ -242,8 +256,22 @@ The orientation value in your JSON must match the image pixel dimensions using t
 """.strip()
 
 
-_TEXT_ZONE_VISUAL_ROLES = frozenset({"brand_group", "headline_group", "legal_text"})
+_TEXT_ZONE_VISUAL_ROLES = frozenset(
+    {"brand_group", "headline_group", "age_badge_group", "legal_text_group"},
+)
 _TEXT_ZONE_LEGACY_LOGO_ROLE = "logo_group"
+_TEXT_ZONE_GROUP_LEGACY_ALIASES: dict[str, str] = {
+    "logo_group": "brand_group",
+    "age_badge": "age_badge_group",
+    "legal_text": "legal_text_group",
+}
+
+
+def _canonical_text_zone_group_role(role_raw: str) -> str:
+    s = (role_raw or "").strip()
+    if s == _TEXT_ZONE_LEGACY_LOGO_ROLE:
+        return "brand_group"
+    return _TEXT_ZONE_GROUP_LEGACY_ALIASES.get(s, s)
 
 
 def _build_analyze_text_zone_visual_prompt() -> str:
@@ -256,19 +284,21 @@ You receive one rendered banner image.
 1) Put the **actual string** read from the image in the JSON **`"text"`** field for **every** child except `logo` / `logo_back` / `logo_fore`. For those three roles **`"text"` must always be `""`** (marks/shapes only — **never** put readable words like **Яндекс** or **Лавка** there). **Do not** leave `"text": ""` on **`brand_name` / `brand_name_first` / `brand_name_second`** when the word is visible. Do **not** hide copy only inside `"reason"`.
 2) **`brand_group` row «Яндекс [heart] Лавка»** (or any **two words + symbol between**): output **exactly** `brand_name_first` (left word, non-empty `text`) + **`logo`** (the **whole** icon cell between words, **`"text": ""`**) + `brand_name_second` (right word, non-empty `text`). **Forbidden:** using **`logo_fore`** or **`logo_back`** for either **word** — `logo_fore` is only the **foreground graphic** (e.g. heart) on a badge when you **split** plate vs mark; it is **not** the word **Лавка**. Do not label the left word as `logo`.
 3) **Assign each readable marketing line to exactly one role once** — no duplicate strings across `brand_group` and `headline_group`. The **service / app name** (e.g. **Яндекс + logo + Лавка**, "DoorDash", "Uber Eats") belongs **only** in **`brand_group`** children. **Never** put that brand line as **`headline`**. **`headline`** is the main **offer / CTA / campaign promise** (e.g. «Доставим лекарства из аптек», "Groceries delivered"). **Visual rule:** the **brand row may use a larger point size than the offer line** — still treat the **identity row** as `brand_group` and the **offer line** as `headline`; **do not** pick `headline` by largest font alone.
-4) **`headline_group` stacking:** **`headline`** = the dominant **offer** block (often the heaviest weight among *promotional* lines). The **closest** line **directly under** that headline (same column, next line down) is **`subheadline_delivery_time`** when it is a **time / speed** fragment (e.g. «от 15 минут», "in 15 min") or **`subheadline`** otherwise. **Split** them: e.g. headline `"Доставим лекарства из аптек"` and **separate** child `subheadline_delivery_time` `"от 15 минут"` — **do not** merge both into one `headline` or one `subheadline_delivery_time` when the image shows **two** lines.
-5) **`legal_text` group:** if you include **any** nested child with role `legal_text`, its **`"text"` must be the full OCR** of **every** visible line in that disclaimer block (seller, address, ОГРН, tax lines, «…», age mark **0+**, etc.). Use newline `\\n` between lines as printed. **Never** `"text": ""` for that child when glyphs exist. Prefer **`"children": []`** only when you are sure there is no structured child needed — otherwise one child with full `text`.
-6) **`headline_group` / `subheadline_delivery_time` (legal vs marketing):** use `subheadline_delivery_time` **only** for a **short** marketing line tied to the hero offer (e.g. «привезёт курьер от 15 минут», «с доставкой от 15 мин», "Delivery in 15 min"). **Do not** put dense multi-line **regulatory / seller / partner / ОГРН** copy here — that entire block belongs under the top-level **`legal_text`** group (see rule 5).
-7) When rule 4 applies (a visible second line under the main headline), you **must** output **`subheadline_delivery_time`** (or `subheadline`) with non-empty **`text`** unless that line is **legal** micro-copy (then it belongs in **`legal_text`**, rule 5–6). Omitting a required marketing subline is an error.
+4) **`headline_group` stacking:** **`headline`** = the dominant **offer** block (often the heaviest weight among *promotional* lines). The **closest** line **directly under** that headline (same column, next line down) is **`subheadline_delivery_time`** when it is a **time / speed** fragment (e.g. «от 15 минут», "in 15 min") or **`subheadline`** otherwise. **Split** them: e.g. headline `"Доставим лекарства из аптек"` and **separate** child `subheadline_delivery_time` `"от 15 минут"` — **do not** merge both into one `headline` or one `subheadline_delivery_time` when the image shows **two** lines. **Concrete RU examples:** (a) headline `"Новогодние продукты от Яндекс Лавки"` **plus** `subheadline_delivery_time` `"с доставкой от 15 минут"` under it — **two** children, **two** bboxes. (b) Pharmacy / Lavka-style: headline `"Доставим лекарства из аптек"` **plus** **separate** line `"от 15 минут"` (or «от 15 минут») as **`subheadline_delivery_time`** — **not** merged into `headline` **text**. **Never** fold a **separate** visual delivery-speed line into `headline`.
+5) **`legal_text_group`:** if you include **any** nested child with role **`legal_text`**, its **`"text"` must be the full OCR** of **every** visible line in that disclaimer block (seller, address, ОГРН, tax lines, «…», etc.). Use newline `\\n` between lines as printed. **Never** `"text": ""` for that child when glyphs exist. Prefer **`"children": []`** only when you are sure there is no structured child needed — otherwise one child with full `text`. *(A **standalone** corner age-rating badge like **«0+»** is **not** this group — use **`age_badge_group`**, rule 8.)*
+6) **`headline_group` / `subheadline_delivery_time` (legal vs marketing):** use `subheadline_delivery_time` **only** for a **short** marketing line tied to the hero offer (e.g. «привезёт курьер от 15 минут», «с доставкой от 15 мин», "Delivery in 15 min"). **Do not** put dense multi-line **regulatory / seller / partner / ОГРН** copy here — that entire block belongs under the top-level **`legal_text_group`** (see rule 5).
+7) When rule 4 applies (a visible second line under the main headline), you **must** output **`subheadline_delivery_time`** (or `subheadline`) with non-empty **`text`** unless that line is **legal** micro-copy (then it belongs in **`legal_text_group`** as a **`legal_text`** child, rules 5–6). Omitting a required marketing subline is an error.
+8) **`age_badge_group` (only when a real mark exists):** Many ads place a **tiny age-rating mark** (**0+**, **6+**, **12+**, **16+**, **18+**) on a **small plate** or as **plain text**, often **white/light on the photo**. **Include `age_badge_group` only when you clearly see** that **small standalone N+** mark — **not** the brand row, not the logo, not a guess. **Anti-hallucination:** **Never** treat the **brand logo** (heart/icon **between** words), **decorative circles**, or **price / volume** digits as **0+**. The real mark is usually **much smaller** than the **brand toolbar** and **not** the same bbox as **Яндекс / Лавка**. **If uncertain, omit `age_badge_group` entirely** — **do not invent** **0+**. **Critical placement:** when present, the mark is often **inside the hero / product photo** (e.g. **top-right** of the **full** frame in **portrait** `upper_image_lower_text`), **not** merged into **`brand_group`**. **Before returning JSON**, **scan all four corners** and the **upper photo band** (top ~55%) for **«0+»**-style glyphs. **Do not** put that standalone badge inside **`legal_text_group`** or **`headline_group`**. **Omit** the whole **`age_badge_group`** when **no** such mark exists.
 
 First classify:
 1. orientation
 2. zone_type
 
-Then detect top-level text groups:
+Then detect top-level text groups (all that apply):
 - brand_group
 - headline_group
-- legal_text
+- age_badge_group (**only when a clear N+ mark exists** — see rule 8; often **on the hero photo**, e.g. top-right)
+- legal_text_group
 
 Then detect inner children.
 
@@ -281,32 +311,39 @@ Include readable brand text in **`brand_name*`** only; never in `logo*`.
 
 For headline_group children (omit if not visible):
 - headline: **required** when headline_group exists — the **dominant campaign / offer** line(s): the main promise consumers read after the brand (e.g. pharmacy delivery, sale, product hook). **Not** the brand name row. **Multi-line hero offer** (e.g. three stacked lines like "GET 10" / "DELIVERIES" / "FOR $0" with the **same** visual weight, color, and hierarchy) is **one** `headline` child: one bbox wrapping **all** of those lines. A **separate** thinner line **immediately below** that block (e.g. «от 15 минут») is **`subheadline_delivery_time`**, not part of `headline` `text`.
-- subheadline_delivery_time: **short** marketing delivery promise next to the hero (speed, courier, minutes). Examples: "с доставкой от 15 минут", "**привезёт курьер от 15 минут**", "Hungry? Delivery is on Us." **Counter-example (wrong role):** multi-line blocks like **ДОСТАВКУ ОСУЩЕСТВЛЯЮТ ПАРТНЕРЫ… / ПРОДАВЕЦ — ООО… / ОГРН** — those are **`legal_text`**, not `subheadline_delivery_time`, even if the first line mentions доставку/партнёров.
+- subheadline_delivery_time: **short** marketing delivery promise next to the hero (speed, courier, minutes). Examples: "с доставкой от 15 минут", "**привезёт курьер от 15 минут**", "Hungry? Delivery is on Us." **Counter-example (wrong role):** multi-line blocks like **ДОСТАВКУ ОСУЩЕСТВЛЯЮТ ПАРТНЕРЫ… / ПРОДАВЕЦ — ООО… / ОГРН** — those belong in **`legal_text_group`** as a **`legal_text`** child, not `subheadline_delivery_time`, even if the first line mentions доставку/партнёров.
 - subheadline_weight: weight/volume/pack/quantity (e.g. "1 кг", "400 г").
 - product_name: product name line (e.g. "Мандарины Абхазия").
 - subheadline_discount: discount/promo amount (e.g. "до 50%", "-52%").
 - subheadline: generic supporting line only when it is **not** delivery-, weight-, product-, or discount-specific.
 Use meaning from read text, not only position. Fill `"text"` with readable OCR for headline and sub-headline children whenever possible.
 
-For legal_text top-level group:
-- Either **`"children": []`** (rare — only when micro-copy is truly absent) **or** exactly **one** child with role `legal_text` whose **`"text"`** is the **complete** OCR of **all** disclaimer lines in the group's bbox (newline-separated). **Forbidden:** a `legal_text` child with `"text": ""` while disclaimer glyphs are visible.
+For **legal_text_group** (top-level):
+- Either **`"children": []`** (rare — only when micro-copy is truly absent) **or** exactly **one** child with role **`legal_text`** whose **`"text"`** is the **complete** OCR of **all** disclaimer lines in the group's bbox (newline-separated). **Forbidden:** a **`legal_text`** child with `"text": ""` while disclaimer glyphs are visible.
 
-Allowed top-level group roles: brand_group, headline_group, legal_text.
+For **age_badge_group** (top-level):
+- **When** a **small standalone** **0+** / **6+** / … mark exists **anywhere** (especially **corners** or **on the product/hero image**), emit this group (rule 8). **Do not** emit it for the **brand/logo** row alone.
+- **One** child with role **`age_badge`**: **`"text"`** = exact OCR (e.g. `"0+"`). Bbox **tight** on the mark, coordinates relative to **full** banner (including photo area).
+- **`"children": []`** only when you **omit the entire `age_badge_group`** because **no** rating mark exists.
+
+Allowed top-level group roles: **brand_group**, **headline_group**, **age_badge_group**, **legal_text_group** (exact strings).
 Allowed brand child roles: logo, logo_back, logo_fore, brand_name, brand_name_first, brand_name_second.
 Allowed headline child roles: headline, subheadline, subheadline_delivery_time, subheadline_weight, product_name, subheadline_discount.
+Allowed **legal_text_group** child role: **legal_text** only.
+Allowed **age_badge_group** child role: **age_badge** only.
 Use role "product_name" exactly (not subheadline_product_name).
 
-legal_text (top-level group) is **tiny dense** regulatory / fee / tax / seller / partner / eligibility disclaimer (often ALL CAPS or small caps, smallest font). It is **not** the main headline stack. **Short** emotional delivery hooks ("Hungry? Delivery is on Us.", «курьер от 15 мин») stay in **headline_group** as `subheadline_delivery_time`. **Partner/seller/address/ОГРН** stacks are **always** `legal_text`. The legal group bbox must cover **all** such micro-lines together (e.g. "$0 DELIVERY FEE…" through "…STILL APPLY." or full RU seller block).
+**legal_text_group** is **tiny dense** regulatory / fee / tax / seller / partner / eligibility disclaimer (often ALL CAPS or small caps, smallest font). It is **not** the main headline stack. **Short** emotional delivery hooks ("Hungry? Delivery is on Us.", «курьер от 15 мин») stay in **headline_group** as `subheadline_delivery_time`. **Partner/seller/address/ОГРН** stacks are **always** a **`legal_text`** child under **`legal_text_group`**. The group bbox must cover **all** such micro-lines together (e.g. "$0 DELIVERY FEE…" through "…STILL APPLY." or full RU seller block).
 
-legal_text group is **mandatory for typical commercial / retail / delivery / promo banners**:
+**legal_text_group** is **mandatory for typical commercial / retail / delivery / promo banners**:
 - These creatives almost always include **footer micro-copy** (e.g. Реклама, ООО, ИНН, «…ограничено», legal disclaimers) in **the smallest font**, often along the **bottom edge** or **base of the text column** (left stack on split layouts).
-- **You must include a top-level legal_text group** with a bbox that tightly wraps **all** such lines whenever **any** disclaimer-sized text exists anywhere in the frame. **Scan the full width of the lower ~30–35%** of the image (and bottom corners) before returning JSON.
-- Do **not** skip legal_text because it is faint or low-contrast — it is still a text zone.
-- If you truly see **zero** micro-copy after careful inspection, omit legal_text (rare for real ads).
+- **You must include a top-level `legal_text_group`** with a bbox that tightly wraps **all** such lines whenever **any** disclaimer-sized text exists anywhere in the frame. **Scan the full width of the lower ~30–35%** of the image (and bottom corners) before returning JSON.
+- Do **not** skip **`legal_text_group`** because it is faint or low-contrast — it is still a text zone.
+- If you truly see **zero** micro-copy after careful inspection, omit **`legal_text_group`** (rare for real ads).
 
 Zone_type disambiguation (do not confuse these):
-- **left_text_right_image**: **Width ≥ height** (landscape or wide) and the layout is a **horizontal split**: a **left text column** (brand + headline + often legal at the bottom of that column) and a **right hero image / scene** filling the remainder. This is the common half-and-half **display ad**. **Do not** label this as upper_text_mid_image_lower_text.
-- **upper_image_lower_text**: A **large photo / scene / illustration** occupies the **upper** portion of the frame; **all** primary marketing copy (brand + headline + legal) sits **below** that image in **one** text stack. **Portrait** ads with **photo on top, blue/text block on bottom** are usually this — **not** `upper_text_mid_image_lower_text` unless there is a **separate text band above** the photo.
+- **left_text_right_image**: **Width ≥ height** (landscape or wide) and the layout is a **horizontal split**: a **left text column** (brand + headline + often legal at the bottom of that column) and a **right hero image / scene** filling the remainder. This is the common half-and-half **display ad**. **If text lives in ~one vertical column and the photo fills the other half, `zone_type` MUST be `left_text_right_image`** — **not** `upper_image_lower_text` (that zone type is for **photo band on top**, text **below** in a **stack**). **Do not** label `left_text_right_image` as `upper_text_mid_image_lower_text` without a **third** top text strip above the photo.
+- **upper_image_lower_text**: A **large photo / scene / illustration** occupies the **upper** portion of the frame; **all** primary marketing copy (brand + headline + legal) sits **below** that image in **one** text stack. **Portrait** ads with **photo on top, blue/text block on bottom** are usually this — **not** `upper_text_mid_image_lower_text` unless there is a **separate text band above** the photo. **Age badges** (**0+**, …) are often **printed on the photo** (e.g. upper-right) — still output **`age_badge_group`** (child **`age_badge`**) with bbox in **full-frame** coordinates (rule 8).
 - **upper_text_mid_image_lower_text**: Requires **three** clear **horizontal bands** in order: (**1**) **dedicated text strip at the very top** of the frame (headline/CTA **above** the hero image), (**2**) **hero image in the middle**, (**3**) **another text strip at the bottom** (e.g. footer). If there is **no** main copy strip **above** the hero — only image then text — use **upper_image_lower_text**.
 - **whole_text_no_image**: no dominant hero product photo; mostly type and background.
 
@@ -318,7 +355,7 @@ Orientation rules:
 Allowed zone_type values:
 left_text_right_image, upper_image_lower_text, whole_text_no_image, upper_text_mid_image_lower_text
 
-Return JSON only (no markdown, no code fences). Include **three** top-level groups when brand, headline, and footer micro-copy are all present (typical ad):
+Return JSON only (no markdown, no code fences). Include **brand_group**, **headline_group**, and **`legal_text_group`** whenever those regions exist; add **`age_badge_group`** only when a **small real** rating mark is visible (see rule 8). Example shape:
 {
   "orientation": "...",
   "zone_type": "...",
@@ -341,26 +378,50 @@ Return JSON only (no markdown, no code fences). Include **three** top-level grou
         "children": []
       },
       {
-        "role": "legal_text",
+        "role": "age_badge_group",
+        "bbox": {"x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0},
+        "confidence": 0.0,
+        "reason": "Age rating mark e.g. 0+",
+        "children": [
+          {
+            "role": "age_badge",
+            "text": "0+",
+            "bbox": {"x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0},
+            "confidence": 0.0,
+            "reason": "OCR of badge"
+          }
+        ]
+      },
+      {
+        "role": "legal_text_group",
         "bbox": {"x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0},
         "confidence": 0.0,
         "reason": "Footer disclaimer / INN / ООО",
-        "children": []
+        "children": [
+          {
+            "role": "legal_text",
+            "text": "…full OCR of disclaimer lines…",
+            "bbox": {"x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0},
+            "confidence": 0.0,
+            "reason": "OCR of footer block"
+          }
+        ]
       }
     ]
   }
 }
+(Omit the **`age_badge_group`** object from `groups` entirely when no such mark appears.)
 
 Rules:
 - Return JSON only. No ``` fences.
 - Output one fully closed JSON object (balanced braces/brackets). Do not stop mid-JSON.
 - Do not output logo_group (use brand_group).
 - Do not invent roles outside the allowed lists.
-- Do not analyze product/person/hero image/background/decorations.
+- Do not analyze product/person/hero image/background/decorations **for decorative layout** — **except** you **must** still read **standalone age-rating marks** (**0+**, **6+**, …) on the photo or in corners and output **`age_badge_group`** with an **`age_badge`** child (rule 8).
 - Each bbox: object with "x","y","width","height" (0..1 relative to full banner). No bare numbers after "x": without keys.
-- **"text" field (OCR / transcription):** `logo` / `logo_back` / `logo_fore` → **`"text"` always `""`**. For **every other** child you **must** set `"text"` to the **exact readable string** from the image (Unicode as printed). That includes **`legal_text` nested under the `legal_text` group** (full disclaimer), plus `brand_name*`, `headline`, all `subheadline*` roles, and `product_name`. **Never use `"text": ""`** on those when the words are visible. **Bad examples:** `"headline": { ..., "text": "" }` while readable; **`legal_text` child with empty `text`** while the footer is visible; **`logo` with `"text": "Яндекс"`** — wrong role, use `brand_name_first`.
-- Omit absent **children** inside groups when not visible. For top-level groups: **always include brand_group, headline_group, and legal_text** whenever those regions exist; **legal_text is almost never absent** on real commercial banners.
-- Keep each "reason" string short (about one line). For **legal_text** group: use **`children: []`** or **one** child with **full** disclaimer text — do not add a placeholder child with empty `text`.
+- **"text" field (OCR / transcription):** `logo` / `logo_back` / `logo_fore` → **`"text"` always `""`**. For **every other** child you **must** set `"text"` to the **exact readable string** from the image (Unicode as printed). That includes **`legal_text` child under `legal_text_group`** (full disclaimer), **`age_badge` child under `age_badge_group`** (e.g. `"0+"`), plus `brand_name*`, `headline`, all `subheadline*` roles, and `product_name`. **Never use `"text": ""`** on those when the glyphs are visible. **Bad examples:** `"headline": { ..., "text": "" }` while readable; **`legal_text` child with empty `text`** while the footer is visible; **`logo` with `"text": "Яндекс"`** — wrong role, use `brand_name_first`.
+- Omit absent **children** inside groups when not visible. For top-level groups: **always include brand_group, headline_group, and `legal_text_group`** whenever those regions exist; **footer disclaimer is almost never absent** on real commercial banners. **`age_badge_group`**: **omit the whole group** when **no** clear **N+** mark exists (rule 8 — **never** guess from the brand/logo row).
+- Keep each "reason" string short (about one line). For **`legal_text_group`**: use **`children: []`** or **one `legal_text` child** with **full** disclaimer text — do not add a placeholder child with empty `text`.
 
 **Final checklist before you output JSON:**
 0) **zone_type:** image-on-top + single text stack below (portrait DM) → **`upper_image_lower_text`** unless a real **text band sits above** the photo (then `upper_text_mid_image_lower_text`).
@@ -368,7 +429,8 @@ Rules:
 1b) `brand_name` / `brand_name_*`: `"text"` = exact string (e.g. DOORDASH, Яндекс, Лавка).
 2) `headline`: **offer only** — `"text"` = main promise (e.g. «Доставим лекарства из аптек»); multi-line **same-weight** offer = one `headline` with one bbox (e.g. GET 10 + DELIVERIES + FOR $0).
 3) **Mandatory** when visible: the **next line down** under that offer (e.g. «от 15 минут») → **`subheadline_delivery_time`** with its **own** bbox and non-empty `"text"` (CRITICAL headline stacking, rule 4).
-4) Footer / seller / partner / ОГРН block: top-level `legal_text` group bbox wraps **all** micro-lines; nested `legal_text` child's `"text"` = **full** OCR (newlines as printed). **Never** empty `text` for that child when the block exists.
+4) Footer / seller / partner / ОГРН block: top-level **`legal_text_group`** bbox wraps **all** micro-lines; nested **`legal_text`** child's `"text"` = **full** OCR (newlines as printed). **Never** empty `text` for that child when the block exists.
+5) **Age badge:** only if a **small real** **0+** / **6+** / … mark is visible (often **top-right on the photo**), **`age_badge_group`** + **`age_badge`** with **tight** bbox — **not** on the brand/logo strip. If none, **omit** the group (rule 8).
 
 The orientation value must match image pixel dimensions using the orientation rules above.
 """.strip()
@@ -514,7 +576,7 @@ def _dedupe_text_zone_groups_by_role(
             warnings.append(
                 f"Duplicate role={role!r}: dropped lower confidence ({cf:.4f} vs kept {pcf:.4f})",
             )
-    order = ("brand_group", "headline_group", "legal_text")
+    order = ("brand_group", "headline_group", "age_badge_group", "legal_text_group")
     return [by_role[r] for r in order if r in by_role]
 
 
@@ -539,6 +601,7 @@ _TEXT_ZONE_HEADLINE_CHILD_ROLES = frozenset(
     },
 )
 _TEXT_ZONE_LEGAL_CHILD_ROLES = frozenset({"legal_text"})
+_TEXT_ZONE_AGE_BADGE_CHILD_ROLES = frozenset({"age_badge"})
 _TEXT_ZONE_LOGO_CHILD_ROLES = frozenset({"logo", "logo_back", "logo_fore"})
 _TEXT_ZONE_CHILD_TEXT_MAX_CHARS = 8000
 _TEXT_ZONE_CHILD_ROLE_ALIASES = {
@@ -558,8 +621,10 @@ def _allowed_child_roles_for_parent(parent_role: str) -> frozenset[str]:
         return _TEXT_ZONE_BRAND_CHILD_ROLES
     if parent_role == "headline_group":
         return _TEXT_ZONE_HEADLINE_CHILD_ROLES
-    if parent_role == "legal_text":
+    if parent_role == "legal_text_group":
         return _TEXT_ZONE_LEGAL_CHILD_ROLES
+    if parent_role == "age_badge_group":
+        return _TEXT_ZONE_AGE_BADGE_CHILD_ROLES
     return frozenset()
 
 
@@ -582,8 +647,12 @@ def _child_role_sort_index(parent_role: str, child_role: str) -> int:
             "product_name",
             "subheadline_discount",
         )
-    else:
+    elif parent_role == "legal_text_group":
         order = ("legal_text",)
+    elif parent_role == "age_badge_group":
+        order = ("age_badge",)
+    else:
+        order = ()
     try:
         return order.index(child_role)
     except ValueError:
@@ -766,11 +835,80 @@ def _warn_headline_group_missing_headline_child(groups: list[dict[str, Any]], wa
 
 def _warn_missing_legal_text_top_level(groups: list[dict[str, Any]], warnings: list[str]) -> None:
     roles = {str(g.get("role", "") or "") for g in groups}
-    if "legal_text" not in roles:
+    if "legal_text_group" not in roles:
         warnings.append(
-            "No legal_text top-level group. Commercial banners normally include disclaimer/footer micro-copy "
+            "No legal_text_group top-level group. Commercial banners normally include disclaimer/footer micro-copy "
             "(e.g. Реклама, ООО, ИНН) — re-check the bottom ~35% of the canvas and lower corners.",
         )
+
+
+def _maybe_strip_hallucinated_age_badge_on_brand_row(
+    groups: list[dict[str, Any]],
+    warnings: list[str],
+) -> None:
+    """
+    Drop ``age_badge_group`` when the only ``age_badge`` child bbox is implausibly merged
+    with the brand toolbar (common VLM false positive for ``0+`` on logo/brand corner).
+    """
+    brand_bbox: Any = None
+    for g in groups:
+        if str(g.get("role", "") or "") == "brand_group":
+            brand_bbox = g.get("bbox")
+            break
+    if not isinstance(brand_bbox, dict):
+        return
+    drop = False
+    for g in groups:
+        if str(g.get("role", "") or "") != "age_badge_group":
+            continue
+        ch = g.get("children")
+        if not isinstance(ch, list):
+            continue
+        for c in ch:
+            if not isinstance(c, dict):
+                continue
+            if str(c.get("role", "") or "").strip() != "age_badge":
+                continue
+            if should_strip_age_badge_group_vs_brand(brand_bbox, c.get("bbox")):
+                drop = True
+                break
+        if drop:
+            break
+    if not drop:
+        return
+    warnings.append(
+        "Removed age_badge_group: age_badge bbox matches the brand row size/placement "
+        "(likely hallucinated N+; real marks are usually a much smaller plate elsewhere).",
+    )
+    groups[:] = [g for g in groups if str(g.get("role", "") or "") != "age_badge_group"]
+
+
+def _warn_age_badge_group_incomplete(groups: list[dict[str, Any]], warnings: list[str]) -> None:
+    for g in groups:
+        if str(g.get("role", "") or "") != "age_badge_group":
+            continue
+        ch = g.get("children")
+        if not isinstance(ch, list) or not ch:
+            warnings.append(
+                "age_badge_group present but children missing or empty; add one child role age_badge with "
+                "text like \"0+\" and a tight bbox.",
+            )
+            continue
+        ok = False
+        for c in ch:
+            if not isinstance(c, dict):
+                continue
+            if str(c.get("role", "") or "").strip() != "age_badge":
+                continue
+            t = str(c.get("text", "") or "").strip()
+            if t:
+                ok = True
+                break
+        if not ok:
+            warnings.append(
+                "age_badge_group present but no child with role age_badge and non-empty text; transcribe the "
+                "badge (e.g. 0+).",
+            )
 
 
 def _warn_headline_group_missing_subheadline_support(groups: list[dict[str, Any]], warnings: list[str]) -> None:
@@ -840,11 +978,12 @@ def _finalize_text_zone_groups(
         if not isinstance(item, dict):
             continue
         role_raw = str(item.get("role", "") or "").strip()
-        if role_raw == _TEXT_ZONE_LEGACY_LOGO_ROLE:
-            warnings.append(f"text_zone.groups[{i}]: role logo_group converted to brand_group")
-            role = "brand_group"
-        else:
-            role = role_raw
+        role = _canonical_text_zone_group_role(role_raw)
+        if role != role_raw:
+            if role_raw == _TEXT_ZONE_LEGACY_LOGO_ROLE:
+                warnings.append(f"text_zone.groups[{i}]: role logo_group converted to brand_group")
+            else:
+                warnings.append(f"text_zone.groups[{i}]: role {role_raw!r} normalized to {role!r}")
         if role not in _TEXT_ZONE_VISUAL_ROLES:
             warnings.append(f"Dropped text_zone.groups[{i}] invalid role={role_raw!r}")
             continue
@@ -868,11 +1007,458 @@ def _finalize_text_zone_groups(
             }
         )
     deduped = _dedupe_text_zone_groups_by_role(out, warnings)
+    _maybe_strip_hallucinated_age_badge_on_brand_row(deduped, warnings)
     _warn_headline_group_missing_headline_child(deduped, warnings)
     _warn_missing_legal_text_top_level(deduped, warnings)
     _warn_headline_group_missing_subheadline_support(deduped, warnings)
     _warn_brand_group_missing_word_children(deduped, warnings)
+    _warn_age_badge_group_incomplete(deduped, warnings)
     return deduped
+
+
+def _age_badge_auxiliary_pass_enabled() -> bool:
+    return os.environ.get("QWEN_AGE_BADGE_AUX", "1").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _build_age_badge_auxiliary_prompt() -> str:
+    return """
+You inspect one banner image for a **small regulatory AGE RATING mark** only.
+
+What counts: a **standalone** mark like **0+**, **6+**, **12+**, **16+**, **18+** (digits then plus), often **white/light** text, often in a **corner** or **on top of a photo / product** — **not** a long legal disclaimer paragraph.
+
+Return **JSON only** (no markdown, no fences), one object:
+{
+  "present": false,
+  "text": "",
+  "bbox": {"x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0},
+  "confidence": 0.0
+}
+
+Rules:
+- Set **present** to **true** only if you **clearly** see that age mark alone.
+- If **present** is **true**, **text** must be the exact characters (e.g. **"0+"**), and **bbox** must **tightly** wrap **only** that mark, with **x, y, width, height** normalized to **0..1** relative to the **full image** (width and height).
+- If **present** is **false**, leave **text** empty and bbox may be zeros.
+- **confidence** in 0..1 for your **present** decision.
+
+Scan **all four corners** and the **upper half** of the image before answering.
+""".strip()
+
+
+def _coerce_aux_present_flag(v: Any) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    s = str(v or "").strip().lower()
+    return s in ("true", "yes", "1", "y", "on")
+
+
+def _normalize_age_badge_ocr(raw: str) -> str:
+    s = re.sub(r"\s+", "", (raw or "").strip())
+    if re.fullmatch(r"\d{1,2}\+", s):
+        return s
+    return ""
+
+
+def _try_build_age_badge_group_from_auxiliary_payload(
+    data: dict[str, Any],
+    warnings: list[str],
+    *,
+    pixel_w: int,
+    pixel_h: int,
+) -> dict[str, Any] | None:
+    if not _coerce_aux_present_flag(data.get("present", data.get("has_age_badge"))):
+        return None
+    tnorm = _normalize_age_badge_ocr(str(data.get("text", "") or ""))
+    if not tnorm:
+        warnings.append(
+            "age_badge auxiliary VLM: present=true but \"text\" is not a valid age mark (expected like 0+, 6+, 12+); ignored.",
+        )
+        return None
+    bbox = _finalize_normalized_bbox(data.get("bbox"), pixel_w, pixel_h)
+    if bbox is None:
+        warnings.append("age_badge auxiliary VLM: present=true but bbox invalid; ignored.")
+        return None
+    try:
+        cf = float(data.get("confidence", 0.85) or 0.85)
+    except (TypeError, ValueError):
+        cf = 0.85
+    cf = max(0.0, min(1.0, cf))
+    ch_raw = [
+        {
+            "role": "age_badge",
+            "text": tnorm,
+            "bbox": bbox,
+            "confidence": cf,
+            "reason": "Auxiliary age-rating pass",
+        },
+    ]
+    ch_final = _finalize_text_zone_children(
+        "age_badge_group",
+        ch_raw,
+        warnings,
+        pixel_w=pixel_w,
+        pixel_h=pixel_h,
+    )
+    if not ch_final:
+        return None
+    return {
+        "role": "age_badge_group",
+        "bbox": bbox,
+        "confidence": cf,
+        "reason": "Supplemented by auxiliary age-rating VLM pass",
+        "children": ch_final,
+    }
+
+
+def _legal_text_auxiliary_pass_enabled() -> bool:
+    return os.environ.get("QWEN_LEGAL_TEXT_AUX", "1").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _build_legal_text_auxiliary_prompt() -> str:
+    return """
+You inspect one **advertising / retail / delivery banner** image for **footer or disclaimer micro-copy** only.
+
+What counts: the **smallest** type on the canvas — regulatory lines, seller / partner / tax / eligibility text (often ALL CAPS or narrow caps), **ОГРН**, **ООО**, **ИНН**, «…ограничено», **РЕКЛАМА**, pharmacy / delivery partner disclaimers, etc. Usually along the **bottom** of the frame or **base of the text column** (including **solid-color** lower bands in portrait **upper_image_lower_text** layouts).
+
+**Do not** include the main headline, brand name row, or short marketing lines like «от 15 минут» — only the **dense legal / disclaimer block**.
+
+Return **JSON only** (no markdown, no fences), one object:
+{
+  "present": false,
+  "text": "",
+  "bbox": {"x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0},
+  "confidence": 0.0
+}
+
+Rules:
+- **present** = **true** only if you **clearly** read such a micro-copy block.
+- If **present** is **true**, **text** must be the **full OCR** of **every** line in that block (join lines with `\\n` as printed). **Do not** truncate mid-sentence.
+- **bbox** must wrap **all** of that micro-copy, **x,y,width,height** normalized **0..1** to the **full image**.
+- If **present** is **false**, **text** empty and bbox may be zeros.
+- **confidence** in 0..1.
+
+Scan the **bottom ~40%** of the image and **full width** before answering.
+""".strip()
+
+
+_LEGAL_AUX_MARKER_SUBSTRINGS = (
+    "огрн",
+    "ооо",
+    "инн",
+    "реклама",
+    "количество",
+    "продавец",
+    "ограничен",
+    "доставк",
+    "раздел",
+    "аптек",
+    "партнер",
+    "предоставля",
+    "сервис",
+    "рекламодател",
+    "ограничено",
+)
+
+
+def _legal_aux_text_plausible_disclaimer(text: str) -> bool:
+    """Reject one-line hallucinations; accept typical RU/EN footer micro-copy."""
+    t = (text or "").strip()
+    if len(t) < 12:
+        return False
+    tl = t.lower()
+    if any(s in tl for s in _LEGAL_AUX_MARKER_SUBSTRINGS):
+        return True
+    return len(t) >= 80
+
+
+def _try_build_legal_text_group_from_auxiliary_payload(
+    data: dict[str, Any],
+    warnings: list[str],
+    *,
+    pixel_w: int,
+    pixel_h: int,
+) -> dict[str, Any] | None:
+    if not _coerce_aux_present_flag(data.get("present", data.get("has_legal_text"))):
+        return None
+    raw_text = str(data.get("text", "") or "").strip()
+    if len(raw_text) > _TEXT_ZONE_CHILD_TEXT_MAX_CHARS:
+        raw_text = raw_text[:_TEXT_ZONE_CHILD_TEXT_MAX_CHARS]
+        warnings.append("legal_text auxiliary VLM: disclaimer text truncated to max length.")
+    if not raw_text or not _legal_aux_text_plausible_disclaimer(raw_text):
+        warnings.append(
+            "legal_text auxiliary VLM: present=true but \"text\" does not look like a disclaimer block; ignored.",
+        )
+        return None
+    bbox = _finalize_normalized_bbox(data.get("bbox"), pixel_w, pixel_h)
+    if bbox is None:
+        warnings.append("legal_text auxiliary VLM: present=true but bbox invalid; ignored.")
+        return None
+    try:
+        cf = float(data.get("confidence", 0.85) or 0.85)
+    except (TypeError, ValueError):
+        cf = 0.85
+    cf = max(0.0, min(1.0, cf))
+    ch_raw = [
+        {
+            "role": "legal_text",
+            "text": raw_text,
+            "bbox": bbox,
+            "confidence": cf,
+            "reason": "Auxiliary footer/legal pass",
+        },
+    ]
+    ch_final = _finalize_text_zone_children(
+        "legal_text_group",
+        ch_raw,
+        warnings,
+        pixel_w=pixel_w,
+        pixel_h=pixel_h,
+    )
+    if not ch_final:
+        return None
+    return {
+        "role": "legal_text_group",
+        "bbox": bbox,
+        "confidence": cf,
+        "reason": "Supplemented by auxiliary footer/legal VLM pass",
+        "children": ch_final,
+    }
+
+
+_HEADLINE_SUPPORT_LINE_ROLES = frozenset(
+    {
+        "subheadline",
+        "subheadline_delivery_time",
+        "subheadline_weight",
+        "product_name",
+        "subheadline_discount",
+    },
+)
+_DELIVERY_SUBLINE_AUX_HINT = re.compile(
+    r"(минут|мин\b|доставк|достав|курьер|courier|delivery|\d+\s*min\b|^\s*от\s+\d+\s*мин)",
+    re.IGNORECASE,
+)
+
+
+def _delivery_subline_auxiliary_pass_enabled() -> bool:
+    return os.environ.get("QWEN_DELIVERY_SUBLINE_AUX", "1").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _build_delivery_subline_auxiliary_prompt() -> str:
+    return """
+You inspect one **advertising banner** image for a **single short marketing line about delivery speed or courier timing**
+that sits **directly under** the main **offer / campaign headline** (not the brand name row, not the dense legal footer).
+
+Typical examples: «с доставкой от 15 минут», «привезёт курьер от 15 минут», **«от 15 минут»** alone on the line under **«Доставим лекарства из аптек»**, "Delivery in 15 min", "Ships today".
+
+**Do not** return the main headline itself, **not** the brand line (Яндекс Лавка, etc.), **not** multi-line legal / ОГРН / ИНН / seller disclaimers.
+
+Return **JSON only** (no markdown, no fences), one object:
+{
+  "present": false,
+  "text": "",
+  "bbox": {"x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0},
+  "confidence": 0.0
+}
+
+Rules:
+- **present** = **true** only if that **separate thinner second line** exists **under** the hero offer.
+- If **present** is **true**, **text** = exact OCR of **only** that line (one line, no newlines).
+- **bbox** must **tightly** wrap **only** that line; **x,y,width,height** normalized **0..1** on the **full** image.
+- If **present** is **false**, leave **text** empty; bbox may be zeros.
+- **confidence** in 0..1 for the **present** decision.
+
+Scan the **main text column / stack** (often left side on wide layouts) between the **brand row** and the **tiny legal footer**.
+""".strip()
+
+
+def _delivery_subline_aux_text_plausible(text: str) -> bool:
+    t = (text or "").strip()
+    if len(t) < 6 or len(t) > 220:
+        return False
+    if t.count("\n") > 1:
+        return False
+    if not _DELIVERY_SUBLINE_AUX_HINT.search(t):
+        return False
+    tl = t.lower()
+    if ("огрн" in tl or "инн" in tl) and len(t) > 90:
+        return False
+    if "реклама" in tl and "ооо" in tl and len(t) > 80:
+        return False
+    return True
+
+
+def _headline_group_eligible_for_delivery_subline_aux(g: dict[str, Any]) -> bool:
+    if str(g.get("role", "") or "") != "headline_group":
+        return False
+    ch = g.get("children")
+    if not isinstance(ch, list):
+        return False
+    head_text = ""
+    head_bbox: Any = None
+    for c in ch:
+        if not isinstance(c, dict):
+            continue
+        if str(c.get("role", "") or "").strip() != "headline":
+            continue
+        head_text = str(c.get("text", "") or "").strip()
+        head_bbox = c.get("bbox")
+        break
+    if not head_text:
+        return False
+    for c in ch:
+        if not isinstance(c, dict):
+            continue
+        r = str(c.get("role", "") or "").strip()
+        if r in _HEADLINE_SUPPORT_LINE_ROLES and str(c.get("text", "") or "").strip():
+            return False
+    gb = g.get("bbox")
+    if not isinstance(gb, dict):
+        return False
+    try:
+        gy = float(gb.get("y", 0) or 0)
+        gh = float(gb.get("height", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    # Portrait ``upper_image_lower_text`` stacks often assign headline_group height ~0.08–0.12
+    # for the *whole* offer column even when a second line ("от 15 минут") exists — do not require gh > 0.1.
+    if gh < 0.072:
+        return False
+    long_head = len(head_text) >= 18
+    gap_ok = False
+    if isinstance(head_bbox, dict):
+        try:
+            hy = float(head_bbox.get("y", 0) or 0)
+            hh = float(head_bbox.get("height", 0) or 0)
+        except (TypeError, ValueError):
+            pass
+        else:
+            bottom_g = gy + gh
+            bottom_h = hy + hh
+            gap_ok = bottom_g - bottom_h > 0.034
+    if gap_ok:
+        return True
+    if long_head and gh >= 0.078:
+        return True
+    return False
+
+
+def _any_headline_group_needs_delivery_subline_aux(groups: list[dict[str, Any]]) -> bool:
+    return any(
+        isinstance(g, dict) and _headline_group_eligible_for_delivery_subline_aux(g)
+        for g in groups
+    )
+
+
+def _try_build_delivery_subline_child_from_auxiliary_payload(
+    data: dict[str, Any],
+    headline_text: str,
+    warnings: list[str],
+    *,
+    pixel_w: int,
+    pixel_h: int,
+) -> dict[str, Any] | None:
+    if not _coerce_aux_present_flag(data.get("present", data.get("has_delivery_subline"))):
+        return None
+    raw_text = str(data.get("text", "") or "").strip()
+    if not raw_text or not _delivery_subline_aux_text_plausible(raw_text):
+        warnings.append(
+            "delivery_subline auxiliary VLM: present=true but \"text\" does not look like a short delivery line; "
+            "ignored.",
+        )
+        return None
+    ht = re.sub(r"\s+", " ", (headline_text or "").strip().lower())
+    at = re.sub(r"\s+", " ", raw_text.lower())
+    if ht and (at == ht or (len(at) >= 10 and at in ht)):
+        warnings.append(
+            "delivery_subline auxiliary VLM: returned text duplicates the headline line; ignored.",
+        )
+        return None
+    bbox = _finalize_normalized_bbox(data.get("bbox"), pixel_w, pixel_h)
+    if bbox is None:
+        warnings.append("delivery_subline auxiliary VLM: present=true but bbox invalid; ignored.")
+        return None
+    try:
+        cf = float(data.get("confidence", 0.82) or 0.82)
+    except (TypeError, ValueError):
+        cf = 0.82
+    cf = max(0.0, min(1.0, cf))
+    if cf < 0.34:
+        warnings.append("delivery_subline auxiliary VLM: confidence too low; ignored.")
+        return None
+    ch_raw = [
+        {
+            "role": "subheadline_delivery_time",
+            "text": raw_text,
+            "bbox": bbox,
+            "confidence": cf,
+            "reason": "Auxiliary delivery-subline pass",
+        },
+    ]
+    ch_final = _finalize_text_zone_children(
+        "headline_group",
+        ch_raw,
+        warnings,
+        pixel_w=pixel_w,
+        pixel_h=pixel_h,
+    )
+    if not ch_final:
+        return None
+    return ch_final[0]
+
+
+def _headline_main_text_for_aux(groups: list[dict[str, Any]]) -> str:
+    for g in groups:
+        if str(g.get("role", "") or "") != "headline_group":
+            continue
+        ch = g.get("children")
+        if not isinstance(ch, list):
+            continue
+        for c in ch:
+            if not isinstance(c, dict):
+                continue
+            if str(c.get("role", "") or "").strip() == "headline":
+                return str(c.get("text", "") or "").strip()
+    return ""
+
+
+def _merge_delivery_subline_child_into_headline_group(
+    groups: list[dict[str, Any]],
+    child: dict[str, Any],
+    warnings: list[str],
+    *,
+    pixel_w: int,
+    pixel_h: int,
+) -> bool:
+    for g in groups:
+        if str(g.get("role", "") or "") != "headline_group":
+            continue
+        ch = g.get("children")
+        if not isinstance(ch, list):
+            continue
+        merged_raw = list(ch) + [child]
+        g["children"] = _finalize_text_zone_children(
+            "headline_group",
+            merged_raw,
+            warnings,
+            pixel_w=pixel_w,
+            pixel_h=pixel_h,
+        )
+        warnings.append(
+            "Added subheadline_delivery_time via auxiliary VLM pass (main pass omitted the delivery line under "
+            "the headline).",
+        )
+        return True
+    return False
+
+
+def _drop_stale_missing_legal_warning(warnings: list[str], groups: list[dict[str, Any]]) -> None:
+    roles = {str(g.get("role", "") or "") for g in groups}
+    if "legal_text_group" not in roles:
+        return
+    needles = ("No legal_text_group top-level group.", "No legal_text top-level group.")
+    warnings[:] = [w for w in warnings if not any(n in w for n in needles)]
 
 
 def _slugify_machine_brand(value: str) -> str:
@@ -1907,10 +2493,186 @@ Return JSON only:
             "reason": reason,
         }
 
+    def _maybe_supplement_age_badge_with_second_vlm_pass(
+        self,
+        image: Image.Image,
+        groups_out: list[dict[str, Any]],
+        warnings: list[str],
+        *,
+        pixel_w: int,
+        pixel_h: int,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """
+        When the main text_zone pass omitted ``age_badge_group``, run a short focused VLM JSON task.
+        Returns ``(groups, extra_qwen_calls)`` where ``extra_qwen_calls`` is 0 or 1.
+        """
+        if not _age_badge_auxiliary_pass_enabled():
+            return groups_out, 0
+        roles = {str(g.get("role", "") or "") for g in groups_out}
+        if "age_badge_group" in roles:
+            return groups_out, 0
+        self.ensure_loaded()
+        prompt = _build_age_badge_auxiliary_prompt()
+        t0 = time.perf_counter()
+        try:
+            raw = self._run_model(
+                [image],
+                prompt,
+                max_new_tokens=AGE_BADGE_AUX_MAX_NEW_TOKENS,
+            )
+        except Exception as exc:
+            warnings.append(f"age_badge auxiliary VLM call failed ({type(exc).__name__}: {exc}); skipped.")
+            logger.warning("age_badge auxiliary: model call failed: %s", exc, exc_info=True)
+            return groups_out, 0
+        elapsed = time.perf_counter() - t0
+        logger.info("age_badge auxiliary: model elapsed_seconds=%.4f raw_chars=%d", elapsed, len(raw or ""))
+        data = self._extract_json(raw)
+        if not isinstance(data, dict):
+            warnings.append("age_badge auxiliary VLM: output was not valid JSON after extraction; skipped.")
+            return groups_out, 1
+        group = _try_build_age_badge_group_from_auxiliary_payload(
+            data,
+            warnings,
+            pixel_w=pixel_w,
+            pixel_h=pixel_h,
+        )
+        if group is None:
+            return groups_out, 1
+        merged = _dedupe_text_zone_groups_by_role(groups_out + [group], warnings)
+        _warn_age_badge_group_incomplete(merged, warnings)
+        _aux_txt = None
+        _ch0 = group.get("children")
+        if isinstance(_ch0, list) and _ch0 and isinstance(_ch0[0], dict):
+            _aux_txt = _ch0[0].get("text")
+        logger.info("age_badge auxiliary: merged age_badge group text=%r bbox=%s", _aux_txt, group.get("bbox"))
+        return merged, 1
+
+    def _maybe_supplement_legal_text_with_second_vlm_pass(
+        self,
+        image: Image.Image,
+        groups_out: list[dict[str, Any]],
+        warnings: list[str],
+        *,
+        pixel_w: int,
+        pixel_h: int,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """
+        When the main pass omitted ``legal_text_group``, run a focused VLM task on footer micro-copy.
+        Returns ``(groups, extra_qwen_calls)`` where ``extra_qwen_calls`` is 0 or 1.
+        """
+        if not _legal_text_auxiliary_pass_enabled():
+            return groups_out, 0
+        roles = {str(g.get("role", "") or "") for g in groups_out}
+        if "legal_text_group" in roles:
+            return groups_out, 0
+        self.ensure_loaded()
+        prompt = _build_legal_text_auxiliary_prompt()
+        t0 = time.perf_counter()
+        try:
+            raw = self._run_model(
+                [image],
+                prompt,
+                max_new_tokens=LEGAL_TEXT_AUX_MAX_NEW_TOKENS,
+            )
+        except Exception as exc:
+            warnings.append(f"legal_text auxiliary VLM call failed ({type(exc).__name__}: {exc}); skipped.")
+            logger.warning("legal_text auxiliary: model call failed: %s", exc, exc_info=True)
+            return groups_out, 0
+        elapsed = time.perf_counter() - t0
+        logger.info("legal_text auxiliary: model elapsed_seconds=%.4f raw_chars=%d", elapsed, len(raw or ""))
+        data = self._extract_json(raw)
+        if not isinstance(data, dict):
+            warnings.append("legal_text auxiliary VLM: output was not valid JSON after extraction; skipped.")
+            return groups_out, 1
+        group = _try_build_legal_text_group_from_auxiliary_payload(
+            data,
+            warnings,
+            pixel_w=pixel_w,
+            pixel_h=pixel_h,
+        )
+        if group is None:
+            return groups_out, 1
+        merged = _dedupe_text_zone_groups_by_role(groups_out + [group], warnings)
+        _drop_stale_missing_legal_warning(warnings, merged)
+        _lt_preview = None
+        _lch = group.get("children")
+        if isinstance(_lch, list) and _lch and isinstance(_lch[0], dict):
+            _lt_preview = _lch[0].get("text")
+        _pv = None
+        if _lt_preview is not None:
+            s = str(_lt_preview)
+            _pv = (s[:120] + "…") if len(s) > 120 else s
+        logger.info("legal_text auxiliary: merged legal_text group text_preview=%r bbox=%s", _pv, group.get("bbox"))
+        return merged, 1
+
+    def _maybe_supplement_delivery_subline_with_second_vlm_pass(
+        self,
+        image: Image.Image,
+        groups_out: list[dict[str, Any]],
+        warnings: list[str],
+        *,
+        pixel_w: int,
+        pixel_h: int,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """
+        When the main pass left ``headline_group`` without a delivery/support line but layout suggests
+        a second line under the offer, run a short focused VLM JSON task.
+        """
+        if not _delivery_subline_auxiliary_pass_enabled():
+            return groups_out, 0
+        if not _any_headline_group_needs_delivery_subline_aux(groups_out):
+            return groups_out, 0
+        self.ensure_loaded()
+        prompt = _build_delivery_subline_auxiliary_prompt()
+        t0 = time.perf_counter()
+        try:
+            raw = self._run_model(
+                [image],
+                prompt,
+                max_new_tokens=DELIVERY_SUBLINE_AUX_MAX_NEW_TOKENS,
+            )
+        except Exception as exc:
+            warnings.append(
+                f"delivery_subline auxiliary VLM call failed ({type(exc).__name__}: {exc}); skipped.",
+            )
+            logger.warning("delivery_subline auxiliary: model call failed: %s", exc, exc_info=True)
+            return groups_out, 0
+        elapsed = time.perf_counter() - t0
+        logger.info("delivery_subline auxiliary: model elapsed_seconds=%.4f raw_chars=%d", elapsed, len(raw or ""))
+        data = self._extract_json(raw)
+        if not isinstance(data, dict):
+            warnings.append("delivery_subline auxiliary VLM: output was not valid JSON after extraction; skipped.")
+            return groups_out, 1
+        headline_ctx = _headline_main_text_for_aux(groups_out)
+        child = _try_build_delivery_subline_child_from_auxiliary_payload(
+            data,
+            headline_ctx,
+            warnings,
+            pixel_w=pixel_w,
+            pixel_h=pixel_h,
+        )
+        if child is None:
+            return groups_out, 1
+        if not _merge_delivery_subline_child_into_headline_group(
+            groups_out,
+            child,
+            warnings,
+            pixel_w=pixel_w,
+            pixel_h=pixel_h,
+        ):
+            return groups_out, 1
+        logger.info(
+            "delivery_subline auxiliary: merged subheadline_delivery_time text=%r bbox=%s",
+            child.get("text"),
+            child.get("bbox"),
+        )
+        return groups_out, 1
+
     def analyze_text_zone_visual(self, request: ZoneClassifyRequest) -> dict[str, Any]:
         """
-        One VLM call: orientation + zone_type + text_zone.groups (normalized bboxes only).
-        No Figma IDs, paths, atlas, or candidate/group annotate routes.
+        Main VLM call plus optional small passes: orientation + zone_type + text_zone.groups.
+        May run extra focused calls for missing ``age_badge``, ``legal_text``, or a delivery subline under the
+        headline (see ``debug.qwen_call_count``).
         """
         warnings: list[str] = []
         logger.info("analyze_text_zone_visual: endpoint called path=%r", request.banner_image_path)
@@ -1996,6 +2758,31 @@ Return JSON only:
 
         tz_raw = data.get("text_zone")
         groups_out = _finalize_text_zone_groups(tz_raw, warnings, pixel_w=fw, pixel_h=fh)
+        qwen_calls = 1
+        groups_out, extra_age = self._maybe_supplement_age_badge_with_second_vlm_pass(
+            image,
+            groups_out,
+            warnings,
+            pixel_w=fw,
+            pixel_h=fh,
+        )
+        qwen_calls += extra_age
+        groups_out, extra_legal = self._maybe_supplement_legal_text_with_second_vlm_pass(
+            image,
+            groups_out,
+            warnings,
+            pixel_w=fw,
+            pixel_h=fh,
+        )
+        qwen_calls += extra_legal
+        groups_out, extra_delivery = self._maybe_supplement_delivery_subline_with_second_vlm_pass(
+            image,
+            groups_out,
+            warnings,
+            pixel_w=fw,
+            pixel_h=fh,
+        )
+        qwen_calls += extra_delivery
 
         child_counts = [
             len(g["children"]) if isinstance(g.get("children"), list) else 0 for g in groups_out
@@ -2036,6 +2823,7 @@ Return JSON only:
             "confidence": conf,
             "reason": reason,
             "text_zone": {"groups": groups_out},
+            "debug": {"qwen_call_count": qwen_calls},
         }
 
     def annotate_candidate(self, request: CandidateAnnotateRequest) -> CandidateAnnotation:

@@ -4,7 +4,7 @@
  * one element atlas (no per-hash image library).
  *
  * ``POST …/api/v2/analyze-text-zone-visual-json`` (JSON ``banner_png_base64``, same style as ``/api/convert``):
- * orientation, zone_type, and ``text_zone.groups`` (brand_group, headline_group, legal_text + normalized bboxes) — banner only; no atlas/raw tree.
+ * orientation, zone_type, and ``text_zone.groups`` (brand_group, headline_group, optional age_badge, legal_text + normalized bboxes) — banner only; no atlas/raw tree.
  */
 figma.showUI(__html__, { width: 400, height: 580 });
 
