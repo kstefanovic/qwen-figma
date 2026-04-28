@@ -2,38 +2,35 @@ from __future__ import annotations
 
 ZONE_TYPES: frozenset[str] = frozenset(
     {
-        "left_txt_right_img",
-        "right_txt_left_img",
-        "upper_txt_lower_img",
-        "upper_img_lower_txt",
-        "full_bg_txt_left_img_right",
-        "full_bg_txt_center_img_side",
-        "full_bg_txt_overlay_img",
-        "wide_left_brand_center_txt_right_img",
-        "wide_left_txt_center_info_right_img",
-        "price_left_product_right",
-        "price_top_product_bottom",
-        "offer_left_product_right",
-        "offer_center_product_side",
-        "brand_top_txt_left_img_right",
-        "brand_top_txt_center_img_right",
-        "brand_top_img_upper_txt_lower",
-        "img_dominant_txt_overlay",
-        "img_dominant_txt_bottom",
-        "img_dominant_txt_top",
-        "two_panel_vertical_split",
-        "two_panel_horizontal_split",
-        "repeated_card_grid",
-        "txt_only_center",
-        "txt_only_left",
-        "txt_on_background",
-        "background_only",
-        "mixed_complex",
-        "unknown",
+        "left_text_right_image",
+        "upper_image_lower_text",
+        "whole_text_no_image",
+        "upper_text_mid_image_lower_text",
     }
 )
+
+ORIENTATIONS: frozenset[str] = frozenset({"landscape", "wide", "portrait"})
+
+
+def deterministic_orientation(width: int, height: int) -> str:
+    """Same rules as Qwen service v2 (pixel dimensions)."""
+    if width < 1 or height < 1:
+        return "landscape"
+    r = width / float(height)
+    if r > 3.0:
+        return "wide"
+    if width > height:
+        return "landscape"
+    if width < height:
+        return "portrait"
+    return "landscape"
 
 
 def is_allowed_zone_type(value: str) -> bool:
     s = (value or "").strip()
     return s in ZONE_TYPES
+
+
+def is_allowed_orientation(value: str) -> bool:
+    s = (value or "").strip()
+    return s in ORIENTATIONS

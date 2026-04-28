@@ -7,6 +7,7 @@ import logging
 import math
 import re
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -167,75 +168,72 @@ class BrandContextAnnotation:
         }
 
 
-_ZONE_CLASSIFY_ENUM_BLOCK = """
-left_txt_right_img
-right_txt_left_img
-upper_txt_lower_img
-upper_img_lower_txt
-full_bg_txt_left_img_right
-full_bg_txt_center_img_side
-full_bg_txt_overlay_img
-wide_left_brand_center_txt_right_img
-wide_left_txt_center_info_right_img
-price_left_product_right
-price_top_product_bottom
-offer_left_product_right
-offer_center_product_side
-brand_top_txt_left_img_right
-brand_top_txt_center_img_right
-brand_top_img_upper_txt_lower
-img_dominant_txt_overlay
-img_dominant_txt_bottom
-img_dominant_txt_top
-two_panel_vertical_split
-two_panel_horizontal_split
-repeated_card_grid
-txt_only_center
-txt_only_left
-txt_on_background
-background_only
-mixed_complex
-unknown
-""".strip()
+CLASSIFY_ZONE_V2_MAX_LONG_SIDE = 1280
+
+_CLASSIFY_ZONE_V2_ORIENTATIONS = frozenset({"landscape", "wide", "portrait"})
+_CLASSIFY_ZONE_V2_ZONE_TYPES = frozenset(
+    {
+        "left_text_right_image",
+        "upper_image_lower_text",
+        "whole_text_no_image",
+        "upper_text_mid_image_lower_text",
+    }
+)
 
 
-def _build_zone_classify_prompt() -> str:
-    return f"""
+def _deterministic_orientation_from_dims(width: int, height: int) -> str:
+    """Rules for v2 /classify-zone (from pixel dimensions)."""
+    if width < 1 or height < 1:
+        return "landscape"
+    r = width / float(height)
+    if r > 3.0:
+        return "wide"
+    if width > height:
+        return "landscape"
+    if width < height:
+        return "portrait"
+    return "landscape"
+
+
+def _build_classify_zone_v2_prompt() -> str:
+    return """
 You are an expert banner layout classifier.
-Given a rendered banner image, classify the overall spatial layout into exactly one zone_type from the allowed enum.
 
-Return JSON only:
-{{
-  "zone_type": "...",
-  "orientation": "...",
-  "confidence": 0.0,
-  "reason": "...",
-  "alternatives": [
-    {{"zone_type": "...", "confidence": 0.0}}
-  ]
-}}
+You receive one rendered banner image. Classify the overall layout using ONLY the allowed orientation values and ONLY the allowed zone_type values.
+
+Allowed orientation values:
+landscape, wide, portrait
 
 Allowed zone_type values:
-{_ZONE_CLASSIFY_ENUM_BLOCK}
+left_text_right_image
+upper_image_lower_text
+whole_text_no_image
+upper_text_mid_image_lower_text
 
-Classification guidance:
-- Choose left_txt_right_img when the main text/offer is mainly on the left and the main image/product/person is mainly on the right.
-- Choose right_txt_left_img when the main image is on the left and text is on the right.
-- Choose upper_img_lower_txt when image/photo dominates the upper area and text/brand/offer is below.
-- Choose upper_txt_lower_img when text dominates the upper area and product/image is below.
-- Choose full_bg_txt_overlay_img when text is placed over or inside an image/background rather than in a clean split.
-- Choose full_bg_txt_center_img_side when central text is surrounded by side/background decorative images.
-- Choose wide_left_brand_center_txt_right_img for very wide banners where brand is left, main text is center, and hero/product image is right.
-- Choose price_left_product_right when price is the dominant text on the left and product is on the right.
-- Choose price_top_product_bottom when price is top/upper and product is lower.
-- Choose offer_left_product_right when offer/headline is left and product image is right, but price is not the dominant element.
-- Choose brand_top_txt_left_img_right when brand appears near top and main text left, image right.
-- Choose brand_top_img_upper_txt_lower when brand is top and image/photo is upper with offer text below, often portrait.
-- Choose img_dominant_txt_overlay when the image dominates and text overlays it.
-- Choose txt_on_background when the design is mostly text on colored/graphic background with no clear hero product image.
-- Choose background_only if the frame is only a background or placeholder with no meaningful text/hero.
-- Choose mixed_complex if multiple zones/panels exist and one type cannot describe it.
-- Choose unknown only if classification is impossible.
+Orientation rules:
+- wide if width / height > 3
+- otherwise: if width > height then landscape; if width < height then portrait (if width equals height, use landscape)
+
+Zone type rules:
+- left_text_right_image: text/brand/offer/price mainly on left, main product/person/hero image mainly on right. Use this for both landscape and wide banners when this left/right structure exists.
+- upper_image_lower_text: main image/photo upper, text/brand/offer/legal lower.
+- whole_text_no_image: mostly text on background, no main product/person/hero image. Decorations like leaves, lights, sparkles, lines, or glows do not count as main image.
+- upper_text_mid_image_lower_text: portrait layout with upper text/brand/price, middle product/image, lower legal/badge/small text.
+
+Return JSON only:
+{
+  "orientation": "...",
+  "zone_type": "...",
+  "confidence": 0.0,
+  "reason": "..."
+}
+
+Do not output markdown.
+Do not output extra text.
+Do not invent new zone types.
+Do not classify decorative lights/leaves/sparkles as the main image.
+
+The orientation value in your JSON must match the image pixel dimensions using the orientation rules above (compute from width and height).
 """.strip()
 
 
@@ -695,6 +693,10 @@ def _parse_bbox_canvas_for_crop(candidate: dict[str, Any]) -> tuple[float, float
         )
 
     return (x, y, w, h)
+
+
+class ClassifyZoneUnparseableModelOutput(ValueError):
+    """VLM reply could not be parsed to a JSON object (after relaxed extraction)."""
 
 
 class QwenRuntime:
@@ -1174,47 +1176,97 @@ Return JSON only:
         )
 
     def classify_zone(self, request: ZoneClassifyRequest) -> dict[str, Any]:
-        image = self._load_image(request.banner_image_path)
-        image = self._prepare_image_for_model(image, "classify_zone/banner")
+        """
+        Single-banner layout: orientation + zone_type only (v2). One VLM call.
+        Does not use candidates, groups, or semantic-structure paths.
+        """
+        logger.info("classify_zone: endpoint called path=%r", request.banner_image_path)
+        raw_img = self._load_image(request.banner_image_path)
+        ow, oh = raw_img.size
+        work = raw_img
+        max_pre = int(CLASSIFY_ZONE_V2_MAX_LONG_SIDE)
+        m = max(ow, oh)
+        if m > max_pre and m > 0:
+            scale = max_pre / float(m)
+            rw = max(1, int(round(ow * scale)))
+            rh = max(1, int(round(oh * scale)))
+            work = work.resize((rw, rh), _LANCZOS)
+        rw2, rh2 = work.size
         logger.info(
-            "classify_zone model input: banner=%dx%d path=%r",
-            image.width,
-            image.height,
-            request.banner_image_path,
+            "classify_zone: original_image=%dx%d resized_before_model_prep=%dx%d",
+            ow,
+            oh,
+            rw2,
+            rh2,
         )
-        prompt = _build_zone_classify_prompt()
+        image = self._prepare_image_for_model(work, "classify_zone/banner")
+        fw, fh = image.size
+        logger.info("classify_zone: prepared_for_vlm=%dx%d", fw, fh)
+
+        det_orientation = _deterministic_orientation_from_dims(ow, oh)
+        prompt = _build_classify_zone_v2_prompt()
+        t0 = time.perf_counter()
         raw_output = self._run_model([image], prompt, max_new_tokens=min(int(self.max_new_tokens), 512))
+        qwen_elapsed = time.perf_counter() - t0
+        logger.info("classify_zone: qwen_elapsed_seconds=%.4f", qwen_elapsed)
+
         data = self._extract_json(raw_output)
         if not isinstance(data, dict):
-            return {
-                "zone_type": "unknown",
-                "orientation": "unknown",
-                "confidence": 0.0,
-                "reason": "Failed to parse model JSON output.",
-                "alternatives": [],
-                "raw_model_output": raw_output,
-                "json_parse_ok": False,
-            }
-        alts: list[dict[str, Any]] = []
-        for item in data.get("alternatives") or []:
-            if isinstance(item, dict):
-                try:
-                    c = float(item.get("confidence", 0.0) or 0.0)
-                except (TypeError, ValueError):
-                    c = 0.0
-                alts.append({"zone_type": str(item.get("zone_type", "") or ""), "confidence": c})
+            logger.warning(
+                "classify_zone: invalid JSON from model raw_len=%d",
+                len(raw_output or ""),
+            )
+            raise ClassifyZoneUnparseableModelOutput(raw_output or "")
+
+        model_orientation = str(data.get("orientation", "") or "").strip()
+        zt = str(data.get("zone_type", "") or "").strip()
         try:
             conf = float(data.get("confidence", 0.0) or 0.0)
         except (TypeError, ValueError):
             conf = 0.0
+        reason = str(data.get("reason", "") or "")
+
+        # Orientation is purely geometric from original pixel size; do not trust the VLM here.
+        ori = det_orientation
+        if model_orientation and model_orientation != det_orientation:
+            if model_orientation in _CLASSIFY_ZONE_V2_ORIENTATIONS:
+                logger.info(
+                    "classify_zone: model_orientation=%r overridden by geometry=%r (image %dx%d)",
+                    model_orientation,
+                    det_orientation,
+                    ow,
+                    oh,
+                )
+            else:
+                logger.info(
+                    "classify_zone: invalid model_orientation=%r; using geometry=%r",
+                    model_orientation,
+                    det_orientation,
+                )
+        if zt not in _CLASSIFY_ZONE_V2_ZONE_TYPES:
+            warn = (
+                "Model zone_type not in allowed set; normalized to whole_text_no_image "
+                "(allowed: left_text_right_image, upper_image_lower_text, "
+                "whole_text_no_image, upper_text_mid_image_lower_text)."
+            )
+            zt = "whole_text_no_image"
+            conf = min(conf, 0.2)
+            reason = f"{reason} {warn}".strip() if reason else warn
+            logger.warning("classify_zone: invalid zone_type from model; forced whole_text_no_image")
+
+        logger.info(
+            "classify_zone: parsed orientation=%r zone_type=%r confidence=%.4f reason=%s",
+            ori,
+            zt,
+            conf,
+            (reason[:400] + "…") if len(reason) > 400 else reason,
+        )
+
         return {
-            "zone_type": str(data.get("zone_type", "") or "unknown"),
-            "orientation": str(data.get("orientation", "") or "unknown"),
+            "orientation": ori,
+            "zone_type": zt,
             "confidence": conf,
-            "reason": str(data.get("reason", "") or ""),
-            "alternatives": alts,
-            "raw_model_output": raw_output,
-            "json_parse_ok": True,
+            "reason": reason,
         }
 
     def annotate_candidate(self, request: CandidateAnnotateRequest) -> CandidateAnnotation:
@@ -2221,12 +2273,22 @@ def create_app(
             logger.exception("annotate_banner failed")
             raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}") from e
 
-    @app.post("/annotate/zone-classify")
-    def annotate_zone_classify(request: ZoneClassifyRequest) -> dict[str, Any]:
+    @app.post("/classify-zone")
+    def classify_zone_endpoint(request: ZoneClassifyRequest) -> dict[str, Any]:
         try:
             return runtime.classify_zone(request)
+        except ClassifyZoneUnparseableModelOutput as e:
+            raw = str(e) if e else ""
+            logger.exception("classify_zone: model JSON parse failed")
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": "Model output was not valid JSON after extraction attempts.",
+                    "raw_model_output": raw[:16000],
+                },
+            ) from e
         except Exception as e:
-            logger.exception("annotate_zone_classify failed")
+            logger.exception("classify_zone failed")
             raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}") from e
 
     @app.post("/annotate/candidate")

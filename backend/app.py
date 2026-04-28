@@ -25,11 +25,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from backend.convert_scene import build_convert_semantic_payload
-from backend.pipeline_v2.qwen_zone_classifier import (
-    ZoneClassificationParseError,
-    classify_zone_from_banner_bytes,
-)
-from backend.pipeline_v2.schemas import ClassifyZoneResponse
+from backend.pipeline_v2.qwen_zone_classifier import classify_zone_from_banner_bytes
+from backend.pipeline_v2.schemas import ClassifyZonePluginRequest, ClassifyZoneResponse
 from backend.runner import PipelineRunner
 from backend.schemas import (
     ConvertDebug,
@@ -301,6 +298,21 @@ def _build_convert_annotation_context(run_id: str, pipeline_result: dict[str, An
     }
 
 
+def _classify_zone_v2_from_raw_bytes(raw: bytes) -> ClassifyZoneResponse | JSONResponse:
+    """Shared handler for multipart and JSON plugin entrypoints."""
+    try:
+        return classify_zone_from_banner_bytes(raw, qwen_base_url=QWEN_BASE_URL)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid image or preprocessing failed: {type(exc).__name__}: {exc}",
+        ) from exc
+
+
 def _resolve_convert_execution(body: ConvertRequest) -> tuple[str, bool, str]:
     mode = body.mode or "apply_to_clone_fast"
     if mode == "apply_to_clone_fast":
@@ -333,25 +345,29 @@ async def classify_zone_v2(banner_png: UploadFile = File(..., description="Banne
     raw = await banner_png.read()
     if not raw:
         raise HTTPException(status_code=400, detail="banner_png is empty.")
+    return _classify_zone_v2_from_raw_bytes(raw)
+
+
+@app.post(
+    "/api/v2/classify-zone-json",
+    response_model=ClassifyZoneResponse,
+    responses={
+        502: {
+            "description": "Qwen model output was not valid JSON; raw text is under debug only.",
+            "content": {"application/json": {"schema": {"type": "object"}}},
+        },
+    },
+)
+async def classify_zone_v2_plugin_json(body: ClassifyZonePluginRequest = Body(...)) -> ClassifyZoneResponse | JSONResponse:
+    """
+    Same v2 classification as ``/api/v2/classify-zone``, but **JSON + base64 PNG** like ``/api/convert``.
+    Intended for the Figma plugin main thread (``fetch`` + JSON avoids multipart / CORS issues in the iframe).
+    """
     try:
-        return classify_zone_from_banner_bytes(raw, qwen_base_url=QWEN_BASE_URL)
-    except ZoneClassificationParseError as exc:
-        return JSONResponse(
-            status_code=502,
-            content={
-                "detail": str(exc),
-                "debug": {"raw_model_output": exc.raw_model_output},
-            },
-        )
-    except RuntimeError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid image or preprocessing failed: {type(exc).__name__}: {exc}",
-        ) from exc
+        raw = _decode_png_base64(body.banner_png_base64)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _classify_zone_v2_from_raw_bytes(raw)
 
 
 @app.get("/api/health", response_model=HealthResponse)

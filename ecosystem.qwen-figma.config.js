@@ -1,7 +1,10 @@
 /**
- * PM2 apps load repo-root `.env` inside Python via `env_load.load_project_env()`
- * (see `qwen_service/run_server.py`). Set QWEN_MODEL_PATH / QWEN_VL_FAMILY there, then:
- *   pm2 restart qwen-figma-service
+ * PM2 **v1** stack — process names ``qwen-figma-backend`` / ``qwen-figma-service``.
+ * Ports come from repo-root ``.env`` (typically Qwen **3035**, backend **3037**).
+ * Set QWEN_MODEL_PATH / QWEN_VL_FAMILY there, then: ``pm2 restart qwen-figma-service``
+ *
+ * **v2** stack uses the same ports but ``*-v2`` names: ``ecosystem.qwen-figma.v2.config.js``.
+ * Run only one ecosystem at a time unless you change ports in one file.
  */
 const path = require("path");
 

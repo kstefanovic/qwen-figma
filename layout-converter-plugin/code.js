@@ -2,8 +2,11 @@
  * Figma plugin main thread. HTTP contract for ``POST …/api/convert`` is documented in
  * ``API_CONVERT_CONTRACT.md``. Raster payload is **two** Base64 PNGs only: full banner +
  * one element atlas (no per-hash image library).
+ *
+ * ``POST …/api/v2/classify-zone-json`` (JSON ``banner_png_base64``, same style as ``/api/convert``):
+ * zone classification test — no raw JSON tree, atlas, clone, or layer renames.
  */
-figma.showUI(__html__, { width: 400, height: 330 });
+figma.showUI(__html__, { width: 400, height: 520 });
 
 function normalizeType(type) {
   return String(type || "").toLowerCase().replace(/_/g, " ");
@@ -284,18 +287,19 @@ async function buildElementAtlasPngAndRegions(root, maxCount) {
       format: "PNG",
       constraint: { type: "SCALE", value: scale },
     });
-    const regions = layoutRegions.map((region) => ({
-      ...region,
-      atlas_x: scaledRegionValue(region.atlas_x, scale),
-      atlas_y: scaledRegionValue(region.atlas_y, scale),
-      atlas_width: scaledRegionSize(region.atlas_width, scale),
-      atlas_height: scaledRegionSize(region.atlas_height, scale),
-      atlas_cell_x: scaledRegionValue(region.cell_x, scale),
-      atlas_cell_y: scaledRegionValue(region.cell_y, scale),
-      atlas_cell_width: scaledRegionSize(region.cell_width, scale),
-      atlas_cell_height: scaledRegionSize(region.cell_height, scale),
-      atlas_scale: Number(scale.toFixed(6)),
-    }));
+    const regions = layoutRegions.map((region) =>
+      Object.assign({}, region, {
+        atlas_x: scaledRegionValue(region.atlas_x, scale),
+        atlas_y: scaledRegionValue(region.atlas_y, scale),
+        atlas_width: scaledRegionSize(region.atlas_width, scale),
+        atlas_height: scaledRegionSize(region.atlas_height, scale),
+        atlas_cell_x: scaledRegionValue(region.cell_x, scale),
+        atlas_cell_y: scaledRegionValue(region.cell_y, scale),
+        atlas_cell_width: scaledRegionSize(region.cell_width, scale),
+        atlas_cell_height: scaledRegionSize(region.cell_height, scale),
+        atlas_scale: Number(scale.toFixed(6)),
+      }),
+    );
     return {
       atlasPngBase64: uint8ToBase64(bytes),
       regions,
@@ -880,6 +884,97 @@ function postError(message) {
 }
 
 figma.ui.onmessage = async (msg) => {
+  if (msg.type === "classify-zone-selected-frame") {
+    const selection = figma.currentPage.selection;
+    if (selection.length !== 1 || selection[0].type !== "FRAME") {
+      postError("Select exactly one frame.");
+      sendSelectionInfo();
+      return;
+    }
+    const selectedFrame = selection[0];
+    const backendUrl = String(msg.backendUrl || "").trim().replace(/\/+$/, "");
+    if (!backendUrl) {
+      postError("Backend URL is empty.");
+      return;
+    }
+    const requestUrl = backendUrl + "/api/v2/classify-zone-json";
+    try {
+      postStatus("Exporting banner.png…");
+      const pngBytes = await exportFramePngBytes(selectedFrame);
+      const pngBase64 = uint8ToBase64(pngBytes);
+      postStatus("Calling zone classification…");
+      console.log("POST zone classify:", requestUrl);
+      const requestBody = { banner_png_base64: pngBase64 };
+      const response = await fetch(requestUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(requestBody),
+      });
+      const text = await response.text();
+      let data = null;
+      try {
+        data = text ? JSON.parse(text) : null;
+      } catch (parseErr) {
+        data = null;
+      }
+      if (!response.ok) {
+        const detail =
+          data && typeof data === "object" && data.detail != null
+            ? typeof data.detail === "string"
+              ? data.detail
+              : JSON.stringify(data.detail)
+            : text || "HTTP " + String(response.status);
+        throw new Error(detail);
+      }
+      if (!data || typeof data !== "object") {
+        throw new Error("Invalid JSON from backend.");
+      }
+      postStatus("Zone classification complete.");
+      figma.ui.postMessage({
+        type: "zone-classify-result",
+        ok: true,
+        result: {
+          run_id: data.run_id,
+          mode: data.mode,
+          zone_type: data.zone_type,
+          orientation: data.orientation,
+          confidence: data.confidence,
+          reason: data.reason,
+          debug: data.debug,
+        },
+      });
+      figma.notify(
+        "Zone: " +
+          data.zone_type +
+          " (" +
+          Number(data.confidence).toFixed(2) +
+          ")",
+        { timeout: 5 },
+      );
+      figma.ui.postMessage({ type: "done" });
+      sendSelectionInfo();
+    } catch (err) {
+      console.error("Classify zone failed:", err);
+      var msgText =
+        err && err.stack
+          ? err.message + "\n\n" + err.stack
+          : String(err && err.message ? err.message : err);
+      if (err && err.message === "Failed to fetch") {
+        msgText +=
+          "\n\nFigma only allows requests to origins listed in manifest.json " +
+          "networkAccess.devAllowedDomains (scheme, host, and port must match exactly). " +
+          "Example: http://localhost:30079 and http://127.0.0.1:30079 are different. " +
+          "After changing manifest.json, reload the plugin from Plugins → Development.";
+      }
+      postError(msgText);
+      figma.ui.postMessage({ type: "zone-classify-result", ok: false });
+      sendSelectionInfo();
+    }
+    return;
+  }
+
   if (msg.type !== "convert-selected-frame") return;
 
   const selection = figma.currentPage.selection;

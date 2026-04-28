@@ -8,56 +8,22 @@ from typing import Any
 from env_load import default_qwen_base_url
 
 from backend.pipeline_v2.image_utils import decode_banner_raster, resize_and_encode_for_zone_qwen
-from backend.pipeline_v2.schemas import ClassifyZoneDebug, ClassifyZoneResponse, ZoneAlternativeItem
-from backend.pipeline_v2.zone_types import is_allowed_zone_type
+from backend.pipeline_v2.schemas import ClassifyZoneDebug, ClassifyZoneResponse
+from backend.pipeline_v2.zone_types import (
+    deterministic_orientation,
+    is_allowed_orientation,
+    is_allowed_zone_type,
+)
 from banner_pipeline.qwen_annotator import QwenAnnotator
 
 logger = logging.getLogger(__name__)
 
 
-def compute_orientation(width: int, height: int) -> str:
-    if width < 1 or height < 1:
-        return "unknown"
-    wh = width / float(height)
-    hw = height / float(width)
-    if wh >= 3.0:
-        return "wide"
-    if wh > 1.2:
-        return "landscape"
-    if hw > 1.2:
-        return "portrait"
-    return "square"
-
-
-class ZoneClassificationParseError(Exception):
-    def __init__(self, message: str, raw_model_output: str) -> None:
-        super().__init__(message)
-        self.raw_model_output = raw_model_output
-
-
-def _normalize_alternatives(raw: Any) -> list[ZoneAlternativeItem]:
-    out: list[ZoneAlternativeItem] = []
-    if not isinstance(raw, list):
-        return out
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        zt = str(item.get("zone_type", "") or "").strip()
-        try:
-            conf = float(item.get("confidence", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            conf = 0.0
-        if not is_allowed_zone_type(zt):
-            zt = "unknown"
-        out.append(ZoneAlternativeItem(zone_type=zt, confidence=conf))
-    return out
-
-
-def _normalize_primary_zone_type(raw: str) -> tuple[str, bool]:
-    s = (raw or "").strip()
-    if is_allowed_zone_type(s):
-        return s, False
-    return "unknown", True
+def _coerce_confidence(raw: Any) -> float:
+    try:
+        return float(raw if raw is not None else 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def classify_zone_from_banner_bytes(
@@ -66,8 +32,8 @@ def classify_zone_from_banner_bytes(
     qwen_base_url: str | None = None,
 ) -> ClassifyZoneResponse:
     """
-    End-to-end zone classification: preprocess banner once, one Qwen HTTP call, validate output.
-    Does not touch legacy runner, candidates, heuristics, or convert pipeline.
+    One Qwen ``POST /classify-zone`` call (orientation + zone_type only).
+    Does not use candidates, heuristics, grouping, or convert pipeline.
     """
     t_total0 = time.perf_counter()
     timings: dict[str, float] = {}
@@ -86,45 +52,38 @@ def classify_zone_from_banner_bytes(
     prepared_bytes, _ = resize_and_encode_for_zone_qwen(image)
     timings["resize_image"] = time.perf_counter() - t0
 
-    orientation = compute_orientation(orig_w, orig_h)
+    det_orientation = deterministic_orientation(orig_w, orig_h)
 
     base = ((qwen_base_url or "").strip() or default_qwen_base_url()).rstrip("/")
     annotator = QwenAnnotator(base_url=base)
 
     t0 = time.perf_counter()
-    try:
-        data = annotator.classify_zone_from_banner(prepared_bytes)
-    finally:
-        timings["qwen_classify_zone"] = time.perf_counter() - t0
+    data = annotator.classify_zone_from_banner(prepared_bytes)
+    timings["qwen_classify_zone"] = time.perf_counter() - t0
 
     t0 = time.perf_counter()
-    if not data.get("json_parse_ok", True):
-        timings["parse_qwen_json"] = time.perf_counter() - t0
-        timings["total"] = time.perf_counter() - t_total0
-        logger.info(
-            "pipeline_v2 timing parse_qwen_json: run_id=%s ok=false total=%.3fs timings=%s",
-            run_id,
-            timings["total"],
-            timings,
-        )
-        raise ZoneClassificationParseError(
-            "Qwen returned output that could not be parsed as JSON.",
-            raw_model_output=str(data.get("raw_model_output", "") or ""),
-        )
-
-    raw_zt = str(data.get("zone_type", "") or "")
-    zone_type, invalid_primary = _normalize_primary_zone_type(raw_zt)
+    zone_type = str(data.get("zone_type", "") or "").strip()
+    model_orientation = str(data.get("orientation", "") or "").strip()
+    confidence = _coerce_confidence(data.get("confidence"))
     reason = str(data.get("reason", "") or "")
-    if invalid_primary:
-        warn = f"Model zone_type {raw_zt!r} is not in the allowed enum; normalized to unknown."
-        reason = f"{reason} ({warn})" if reason else warn
 
-    try:
-        confidence = float(data.get("confidence", 0.0) or 0.0)
-    except (TypeError, ValueError):
-        confidence = 0.0
+    # Match Qwen service: orientation from decoded image pixels only (VLM often mislabels portrait).
+    orientation = det_orientation
+    if model_orientation and model_orientation != det_orientation and is_allowed_orientation(model_orientation):
+        note = (
+            f" [orientation from image size: {det_orientation}; model said: {model_orientation}]"
+        )
+        reason = (reason + note).strip() if reason else note.strip()
 
-    alternatives = _normalize_alternatives(data.get("alternatives"))
+    if not is_allowed_zone_type(zone_type):
+        zone_type = "whole_text_no_image"
+        confidence = min(confidence, 0.2)
+        warn = (
+            "Model zone_type not in allowed enum; normalized to whole_text_no_image "
+            "(allowed: left_text_right_image, upper_image_lower_text, "
+            "whole_text_no_image, upper_text_mid_image_lower_text)."
+        )
+        reason = f"{reason} ({warn})".strip() if reason else warn
 
     timings["parse_qwen_json"] = time.perf_counter() - t0
     timings["total"] = time.perf_counter() - t_total0
@@ -148,7 +107,6 @@ def classify_zone_from_banner_bytes(
         orientation=orientation,
         confidence=confidence,
         reason=reason,
-        alternatives=alternatives,
         debug=ClassifyZoneDebug(
             qwen_call_count=1,
             elapsed_seconds=round(timings["total"], 4),

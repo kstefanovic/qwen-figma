@@ -578,7 +578,7 @@ class QwenAnnotator:
 
     def classify_zone_from_banner(self, banner_png: bytes) -> dict[str, Any]:
         """
-        Single ``/annotate/zone-classify`` call with one prepared raster (JPEG/PNG bytes).
+        Single ``POST /classify-zone`` call (v2 banner layout: orientation + zone_type only).
 
         Writes a temporary file on this host; the Qwen service must be able to read the same path
         (typical co-located deployment).
@@ -592,7 +592,7 @@ class QwenAnnotator:
         try:
             path.write_bytes(banner_png)
             return self._post(
-                "/annotate/zone-classify",
+                "/classify-zone",
                 {"banner_image_path": str(path.resolve())},
             )
         finally:

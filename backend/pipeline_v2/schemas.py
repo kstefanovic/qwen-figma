@@ -5,9 +5,10 @@ from typing import Literal
 from pydantic import BaseModel, Field, field_validator
 
 
-class ZoneAlternativeItem(BaseModel):
-    zone_type: str
-    confidence: float = 0.0
+class ClassifyZonePluginRequest(BaseModel):
+    """Figma plugin: same transport as ``/api/convert`` (strict PNG base64, no multipart)."""
+
+    banner_png_base64: str
 
 
 class ClassifyZoneDebug(BaseModel):
@@ -21,16 +22,15 @@ class ClassifyZoneResponse(BaseModel):
     zone_type: str
     orientation: str = Field(
         ...,
-        description="landscape | portrait | square | wide | unknown (from aspect ratio rules)",
+        description="landscape | wide | portrait",
     )
     confidence: float = 0.0
     reason: str = ""
-    alternatives: list[ZoneAlternativeItem] = Field(default_factory=list)
     debug: ClassifyZoneDebug
 
     @field_validator("orientation")
     @classmethod
     def _orientation_allowed(cls, v: str) -> str:
-        allowed = {"landscape", "portrait", "square", "wide", "unknown"}
+        allowed = {"landscape", "portrait", "wide"}
         s = (v or "").strip()
-        return s if s in allowed else "unknown"
+        return s if s in allowed else "landscape"

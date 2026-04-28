@@ -58,6 +58,20 @@
         background: #f7f7f7;
         color: #333;
       }
+
+      .zone-result {
+        min-height: 120px;
+        white-space: pre-wrap;
+        font-size: 12px;
+        line-height: 1.45;
+        padding: 10px;
+        border-radius: 6px;
+        border: 1px solid #e5e5e5;
+      }
+
+      #classify-zone-btn:hover {
+        background: #6d28d9;
+      }
     </style>
   </head>
   <body>
@@ -68,7 +82,7 @@
 
     <div class="row">
       <label for="backend-url">Backend URL</label>
-      <input id="backend-url" value="http://localhost:30079" />
+      <input id="backend-url" value="http://localhost:3037" />
     </div>
 
     <div class="row">
@@ -95,11 +109,26 @@
       <button id="convert-btn">Convert Selected Frame</button>
     </div>
 
+    <div class="row">
+      <button id="classify-zone-btn" type="button" style="background: #7c3aed">
+        Classify Zone (v2 test)
+      </button>
+    </div>
+
+    <div class="row">
+      <label>Zone classification (Qwen v2)</label>
+      <div id="zone-result" class="zone-result readonly">
+        Run “Classify Zone” on one selected frame (JSON to /api/v2/classify-zone-json). No clone, no /api/convert.
+      </div>
+    </div>
+
     <div id="status"></div>
 
     <script>
       const statusEl = document.getElementById("status");
       const convertBtn = document.getElementById("convert-btn");
+      const classifyZoneBtn = document.getElementById("classify-zone-btn");
+      const zoneResultEl = document.getElementById("zone-result");
       const selectedFrameEl = document.getElementById("selected-frame");
 
       function setStatus(message) {
@@ -125,6 +154,10 @@
           `Size: ${info.width} × ${info.height}`;
       }
 
+      function setZoneResult(text) {
+        zoneResultEl.textContent = text;
+      }
+
       convertBtn.onclick = () => {
         const backendUrl = document.getElementById("backend-url").value.trim();
         const targetPreset = document.getElementById("target-preset").value;
@@ -145,6 +178,21 @@
         );
       };
 
+      classifyZoneBtn.onclick = () => {
+        const backendUrl = document.getElementById("backend-url").value.trim();
+        setStatus("Classify zone: exporting frame…");
+        setZoneResult("…");
+        parent.postMessage(
+          {
+            pluginMessage: {
+              type: "classify-zone-selected-frame",
+              backendUrl
+            }
+          },
+          "*"
+        );
+      };
+
       window.onmessage = (event) => {
         const msg = event.data.pluginMessage;
         if (!msg) return;
@@ -157,6 +205,22 @@
           setStatus("Done.");
         } else if (msg.type === "selection-info") {
           setSelectedFrameInfo(msg.selection);
+        } else if (msg.type === "zone-classify-result") {
+          if (!msg.ok || !msg.result) {
+            setZoneResult("Classification failed. See status above.");
+            return;
+          }
+          const r = msg.result;
+          setZoneResult(
+            `zone_type: ${r.zone_type}\n` +
+              `confidence: ${Number(r.confidence).toFixed(4)}\n` +
+              `orientation: ${r.orientation != null ? r.orientation : "—"}\n` +
+              `reason:\n${r.reason != null ? r.reason : "—"}\n` +
+              (r.run_id ? `\nrun_id: ${r.run_id}` : "") +
+              (r.debug && typeof r.debug === "object"
+                ? `\n\ndebug: qwen_call_count=${r.debug.qwen_call_count} elapsed_seconds=${r.debug.elapsed_seconds}`
+                : "")
+          );
         }
       };
     </script>

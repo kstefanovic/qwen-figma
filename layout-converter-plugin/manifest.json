@@ -7,6 +7,17 @@
   "editorType": ["figma"],
   "networkAccess": {
     "allowedDomains": ["https://theye-inference.onrender.com"],
-    "devAllowedDomains": ["http://localhost:30079"]
+    "devAllowedDomains": [
+      "http://localhost:30079",
+      "http://127.0.0.1:30079",
+      "http://localhost:3037",
+      "http://127.0.0.1:3037",
+      "http://localhost:3047",
+      "http://127.0.0.1:3047",
+      "http://localhost:3035",
+      "http://127.0.0.1:3035",
+      "http://localhost:3045",
+      "http://127.0.0.1:3045"
+    ]
   }
 }
