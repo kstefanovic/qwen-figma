@@ -309,6 +309,47 @@ def _is_top_right_region(node: CollapsedNode) -> bool:
     return node.x_norm >= 0.7 and node.y_norm <= 0.25
 
 
+def _is_brand_strip_region(node: CollapsedNode) -> bool:
+    """Top strip (left through upper-center) where logos and wordmarks usually sit."""
+    return float(node.y_norm) <= 0.30 and float(node.x_norm + node.w_norm) <= 0.68
+
+
+def _cluster_bbox_norm(nodes: list[CollapsedNode]) -> tuple[float, float, float, float]:
+    x0 = min(float(n.x_norm) for n in nodes)
+    y0 = min(float(n.y_norm) for n in nodes)
+    x1 = max(float(n.x_norm) + float(n.w_norm) for n in nodes)
+    y1 = max(float(n.y_norm) + float(n.h_norm) for n in nodes)
+    return x0, y0, x1, y1
+
+
+def _expanded_cluster_intersects_node(nodes: list[CollapsedNode], node: CollapsedNode, pad: float) -> bool:
+    if not nodes:
+        return False
+    x0, y0, x1, y1 = _cluster_bbox_norm(nodes)
+    x0 -= pad
+    y0 -= pad
+    x1 += pad
+    y1 += pad
+    nx0, ny0 = float(node.x_norm), float(node.y_norm)
+    nx1, ny1 = nx0 + float(node.w_norm), ny0 + float(node.h_norm)
+    return not (nx1 < x0 or nx0 > x1 or ny1 < y0 or ny0 > y1)
+
+
+def _likely_brand_wordmark_node(node: CollapsedNode) -> bool:
+    if not _is_text(node):
+        return False
+    t = _node_text(node).strip()
+    if not t or len(t) > 36:
+        return False
+    tl = t.lower()
+    prefixes = ("get ", "до ", "скид", "бесплат", "order ", "заказ", "delivery ", "достав")
+    if any(tl.startswith(p) for p in prefixes):
+        return False
+    if t.count(" ") > 5:
+        return False
+    return True
+
+
 def _is_bottom_region(node: CollapsedNode) -> bool:
     return node.y_norm >= 0.72
 
@@ -330,7 +371,13 @@ def _is_long_text(node: CollapsedNode) -> bool:
 
 
 def _is_star_like(node: CollapsedNode) -> bool:
-    return node.type.lower() == "star"
+    tl = node.type.lower()
+    if tl == "star":
+        return True
+    nm = (node.name or "").lower()
+    if "star" in nm and tl in {"vector", "boolean_operation", "ellipse", "line", "rectangle", "polygon"}:
+        return True
+    return False
 
 
 def _is_large_background_like(node: CollapsedNode) -> bool:
@@ -402,13 +449,13 @@ def _build_brand_candidates(nodes: list[CollapsedNode], bundle: CandidateBundle)
     brand_like_nodes: list[CollapsedNode] = []
 
     for node in nodes:
-        if not _is_top_left_region(node):
+        if not _is_brand_strip_region(node):
             continue
         if _is_text(node):
             continue
 
         if _is_group_like(node) or _is_shape_like(node):
-            if node.area_ratio <= 0.20:
+            if node.area_ratio <= 0.22:
                 brand_like_nodes.append(node)
 
     if not brand_like_nodes:
@@ -419,10 +466,21 @@ def _build_brand_candidates(nodes: list[CollapsedNode], bundle: CandidateBundle)
     seed = brand_like_nodes[0]
     cluster = [seed]
     for node in brand_like_nodes[1:]:
-        close_x = abs(node.center_x_norm - seed.center_x_norm) <= 0.25
-        close_y = abs(node.center_y_norm - seed.center_y_norm) <= 0.18
+        close_x = abs(node.center_x_norm - seed.center_x_norm) <= 0.28
+        close_y = abs(node.center_y_norm - seed.center_y_norm) <= 0.20
         if close_x and close_y:
             cluster.append(node)
+
+    cluster_ids = {n.id for n in cluster}
+    for node in nodes:
+        if node.id in cluster_ids:
+            continue
+        if not _likely_brand_wordmark_node(node):
+            continue
+        if not _expanded_cluster_intersects_node(cluster, node, pad=0.07):
+            continue
+        cluster.append(node)
+        cluster_ids.add(node.id)
 
     candidate = _candidate_from_nodes(
         candidate_id="brand_1",
@@ -431,7 +489,7 @@ def _build_brand_candidates(nodes: list[CollapsedNode], bundle: CandidateBundle)
         role_hint="brand",
         group_hint="brand_group",
         importance_hint="critical",
-        extra_data={"grouping_reason": "top_left_brand_cluster"},
+        extra_data={"grouping_reason": "top_strip_brand_cluster_with_optional_wordmark"},
     )
     _add_candidate(bundle, candidate)
 

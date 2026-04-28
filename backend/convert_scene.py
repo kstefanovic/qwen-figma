@@ -176,6 +176,47 @@ def _glow_export_label(
     return (f"background_glow_{side}", "background_shape")
 
 
+def _raw_node_looks_like_star_shape(node: dict[str, Any] | None) -> bool:
+    """Figma stars are often vectors/booleans named *star*, not type STAR."""
+    if not node:
+        return False
+    tl = str(node.get("type", "")).lower()
+    if tl == "star":
+        return True
+    nm = str(node.get("name") or "").lower()
+    if "star" not in nm:
+        return False
+    return tl in {"vector", "boolean_operation", "ellipse", "line", "rectangle", "polygon"}
+
+
+def _children_all_star_shapes(children: list[dict[str, Any]]) -> bool:
+    if not children:
+        return False
+    return all(_raw_node_looks_like_star_shape(c) for c in children)
+
+
+def _graph_decoration_sources_are_star_only(
+    source_ids: list[str],
+    by_id: dict[str, dict[str, Any]],
+    by_path: dict[str, dict[str, Any]],
+) -> bool:
+    """True when every source node is a star leaf or a frame whose direct children are all stars."""
+    if not source_ids:
+        return False
+    for sid in source_ids:
+        node = by_id.get(sid)
+        if not isinstance(node, dict):
+            return False
+        child_paths = node.get("children_paths") or []
+        if child_paths:
+            kids = [by_path.get(p) for p in child_paths if isinstance(by_path.get(p), dict)]
+            if not kids or not _children_all_star_shapes(kids):
+                return False
+        elif not _raw_node_looks_like_star_shape(node):
+            return False
+    return True
+
+
 def _infer_container_export_from_children(
     node_info: dict[str, Any],
     by_path: dict[str, dict[str, Any]],
@@ -214,15 +255,30 @@ def _infer_container_export_from_children(
     brand_child_hit = any(
         any(
             t in str(c.get("name") or "").lower()
-            for t in ("logo", "brand", "яндекс", "yandex", "лавка", "lavka", "маркет", "market")
+            for t in (
+                "logo",
+                "brand",
+                "brand_name",
+                "яндекс",
+                "yandex",
+                "лавка",
+                "lavka",
+                "маркет",
+                "market",
+            )
         )
         for c in children
     )
 
+    # Logo + outlined brand text often has no text runs on children — still brand_group.
+    if brand_child_hit or (bool(texts) and brand_name_hit):
+        return ("brand_group", "brand_group")
+
     if texts:
-        if brand_name_hit or brand_child_hit:
-            return ("brand_group", "brand_group")
         return ("headline_group", "headline_group")
+
+    if _children_all_star_shapes(children):
+        return ("decoration_star_group", "decoration_group")
 
     shapeish = {"vector", "star", "ellipse", "rectangle", "boolean_operation", "line"}
     if all(str(c.get("type", "")).lower() in shapeish for c in children):
@@ -361,6 +417,8 @@ def _is_generic_figma_name(name: str | None) -> bool:
 
 def _is_generic_semantic_name(name: str | None) -> bool:
     raw = (name or "").strip().lower()
+    if raw.startswith("brand_name_") and raw != "brand_name_unknown":
+        return False
     return raw in {"", "unknown", "node", "text", "group", "visual_asset", "brand_text"}
 
 
@@ -369,7 +427,7 @@ def _is_decoration_semantic_label(name: str | None) -> bool:
     n = (name or "").strip().lower()
     if not n.startswith("decoration_"):
         return False
-    if n in {"decoration_group"}:
+    if n in {"decoration_group", "decoration_star_group"}:
         return False
     return True
 
@@ -415,7 +473,12 @@ def _is_member_style_decoration_group_name(name: str | None) -> bool:
         return False
     if sl in {"decoration_sparkle", "decoration_star", "decoration_glow"}:
         return True
-    return sl.startswith("decoration_sparkle_") or sl.startswith("decoration_star_")
+    if sl.startswith("decoration_sparkle_"):
+        return True
+    # decoration_star_1 etc., not decoration_star_group (real container name)
+    if sl.startswith("decoration_star_"):
+        return sl != "decoration_star_group"
+    return False
 
 
 def _finalize_group_export_semantic_name(group_role: str, semantic_name: str | None) -> str:
@@ -475,7 +538,7 @@ def _finalize_layer_export_labels(
             return glow
         if _looks_like_background_glow(ni, root_width=root_width, root_height=root_height):
             return (f"background_glow_{_glow_side_from_bounds()}", "background_shape")
-        if tl == "star" or ("star" in nm and wrong_shape_name):
+        if _raw_node_looks_like_star_shape(ni) or ("star" in nm and wrong_shape_name):
             return ("decoration_star", "decoration")
         if mis_dec:
             bb = ni.get("bounds") or {}
@@ -510,7 +573,9 @@ def _finalize_layer_export_labels(
 
     # Frames/groups: infer headline_group / brand_group / decoration_group from children
     if tl in {"group", "frame", "component", "instance"}:
-        if by_path and (mis_dec or loose_visual):
+        # Graph/VLM often assign decoration_group to logo+brand_name_* clusters — still re-check children.
+        ambiguous_decoration_group = n_low == "decoration_group"
+        if by_path and (mis_dec or loose_visual or ambiguous_decoration_group):
             inferred = _infer_container_export_from_children(ni, by_path)
             if inferred:
                 return inferred
@@ -528,6 +593,13 @@ def _finalize_layer_export_labels(
 
 
 def _default_semantic_name(role: str, node_info: dict[str, Any] | None = None) -> str:
+    r = (role or "").lower()
+    if r == "brand_name":
+        txt = (node_info.get("text") or "").strip() if node_info else ""
+        if txt:
+            slug = _safe_slug(txt)
+            return f"brand_name_{slug}" if slug else "brand_name_unknown"
+        return "brand_name_unknown"
     text_name = _semantic_name_from_text(node_info.get("text") if node_info else None)
     if text_name is not None and text_name != "price_group":
         return text_name
@@ -557,6 +629,8 @@ def _default_semantic_name(role: str, node_info: dict[str, Any] | None = None) -
         "decoration_group": "decoration_group",
         "decoration": "decoration",
         "price_group": "price_group",
+        "offer_headline": "offer_headline",
+        "price": "price",
     }
     if role in mapping:
         return mapping[role]
@@ -946,7 +1020,7 @@ def _infer_decoration_children(
                 role, semantic_name = "legal", "legal_text"
             else:
                 role, semantic_name = "headline", "headline"
-        elif ct == "star":
+        elif _raw_node_looks_like_star_shape(child):
             role, semantic_name = "decoration", "decoration_star"
         else:
             role, semantic_name = "decoration", "decoration_sparkle"
@@ -957,7 +1031,7 @@ def _infer_decoration_children(
                 semantic_name=semantic_name,
                 parent_semantic_name=parent_semantic_name,
                 confidence=0.7,
-                reason="Child under decoration_group: split text vs vector vs star from raw node.",
+                reason="Child under decoration cluster: split text vs vector vs star from raw node.",
                 target_width=target_width,
                 target_height=target_height,
                 root_width=root_width,
@@ -1015,7 +1089,7 @@ def _infer_leaf_group_update(
                 role, semantic_name = "legal", "legal_text"
             else:
                 role, semantic_name = "headline", "headline"
-        elif tl == "star":
+        elif _raw_node_looks_like_star_shape(node_info):
             role, semantic_name = "decoration", "decoration_star"
         else:
             role, semantic_name = "decoration", "decoration_sparkle"
@@ -1214,6 +1288,15 @@ def build_convert_semantic_payload(
                     "height": round(bh * th, 2),
                 },
             }
+            text_spans_coalesced: list[dict[str, Any]] | None = None
+            for blob in (scene_override, el, candidate_ann):
+                if isinstance(blob, dict):
+                    tsv = blob.get("text_spans")
+                    if isinstance(tsv, list) and tsv:
+                        text_spans_coalesced = tsv
+                        break
+            if text_spans_coalesced:
+                update["text_spans"] = text_spans_coalesced
             fin_sn, fin_r = _finalize_layer_export_labels(
                 update["semantic_name"],
                 update["role"],
@@ -1225,7 +1308,7 @@ def build_convert_semantic_payload(
             update["semantic_name"] = fin_sn
             update["role"] = fin_r
             merged_updates[(figma_id, path_val)] = update
-            semantic_elements[figma_id] = {
+            sem_row: dict[str, Any] = {
                 "id": element_id,
                 "figma_node_id": figma_id,
                 "path": path_val,
@@ -1235,6 +1318,9 @@ def build_convert_semantic_payload(
                 "confidence": update["confidence"],
                 "reason": update["reason"],
             }
+            if text_spans_coalesced:
+                sem_row["text_spans"] = text_spans_coalesced
+            semantic_elements[figma_id] = sem_row
 
     groups = semantic_graph.get("groups") or []
     if isinstance(groups, list):
@@ -1257,6 +1343,24 @@ def build_convert_semantic_payload(
             )
             group_semantic_name = ann_group_sn or _default_group_semantic_name(group_role)
             group_semantic_name = _finalize_group_export_semantic_name(group_role, group_semantic_name)
+            # Merge graph may label a Figma frame as decoration_group; raw children often prove brand or star-only.
+            if (
+                group_role == "decoration_group"
+                and group_node is not None
+                and group_node.get("id")
+                and _is_container_node(group_node)
+            ):
+                container_repair = _infer_container_export_from_children(group_node, by_path)
+                if container_repair:
+                    rep_sn, _ = container_repair
+                    if rep_sn == "brand_group":
+                        group_role = "brand_group"
+                        group_semantic_name = "brand_group"
+                    elif rep_sn == "decoration_star_group":
+                        group_semantic_name = "decoration_star_group"
+            if group_role == "decoration_group" and group_semantic_name == "decoration_group":
+                if _graph_decoration_sources_are_star_only(source_ids, by_id, by_path):
+                    group_semantic_name = "decoration_star_group"
             group_confidence = float(group_ann.get("confidence", 0.72) or 0.72)
             group_reason = str(group_ann.get("reason_short", "") or f"Grouped as {group_semantic_name} from graph role and raw Figma hierarchy.")
             group_semantic_name_by_id[group_id] = group_semantic_name

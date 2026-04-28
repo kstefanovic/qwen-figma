@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -182,6 +182,7 @@ class Element(BaseModel):
     text_features: Optional[TextFeatures] = None
     style_features: Optional[StyleFeatures] = None
     visual_features: Optional[VisualFeatures] = None
+    text_spans: Optional[List[Dict[str, Any]]] = None
 
     adaptation_policy: AdaptationPolicy = Field(default_factory=AdaptationPolicy)
 

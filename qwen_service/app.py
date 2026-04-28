@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -38,10 +39,33 @@ from qwen_service.schemas import (
 try:
     import torch
     from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
-except Exception:
+except Exception as exc:
+    logger.warning("torch/transformers import failed: %s", exc, exc_info=True)
     torch = None
     AutoProcessor = None
     Qwen2_5_VLForConditionalGeneration = None
+
+
+def resolve_qwen_vl_family(model_path: str, explicit: str | None) -> str:
+    """
+    Which HF architecture to load: qwen2_5 (Qwen2.5-VL) or qwen3 (Qwen3-VL).
+
+    If QWEN_VL_FAMILY is unset or unknown, infer from QWEN_MODEL_PATH (e.g. *Qwen3-VL* → qwen3).
+    """
+    raw = (explicit or "").strip().lower().replace("-", "_")
+    if raw in ("qwen3", "qwen3_vl"):
+        return "qwen3"
+    if raw in ("qwen2_5", "qwen2_5_vl", "qwen25_vl", "qwen25", "qwen2_5vl"):
+        return "qwen2_5"
+    if raw:
+        logger.warning(
+            "Unknown QWEN_VL_FAMILY=%r; inferring from model path. Valid values: qwen2_5, qwen3.",
+            explicit,
+        )
+    p = (model_path or "").lower().replace(" ", "")
+    if "qwen3" in p and "vl" in p:
+        return "qwen3"
+    return "qwen2_5"
 
 
 @dataclass
@@ -367,9 +391,40 @@ def _normalize_importance_level(value: Optional[str]) -> str:
     return "medium"
 
 
+def _normalize_scene_text_spans(raw: Any) -> Optional[list[dict[str, Any]]]:
+    if not isinstance(raw, list) or not raw:
+        return None
+    out: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        span_text = str(item.get("text", "") or "")
+        span_role = str(item.get("role", "") or "").strip().lower()
+        if not span_text or not span_role:
+            continue
+        span_sem = str(item.get("semantic_name", "") or "").strip() or span_role
+        out.append({"text": span_text, "role": span_role, "semantic_name": span_sem})
+    return out or None
+
+
 def _functional_type_from_element_role(role: str) -> str:
     r = (role or "").lower().strip()
-    if r in {"headline", "subheadline", "legal", "brand_mark", "age_badge", "product_image"}:
+    if r in {
+        "headline",
+        "subheadline",
+        "offer_headline",
+        "offer_price_phrase",
+        "price",
+        "price_main",
+        "price_old",
+        "price_fraction",
+        "legal",
+        "brand_mark",
+        "brand_name",
+        "logo_text",
+        "age_badge",
+        "product_image",
+    }:
         return "functional"
     if r in {"background", "background_panel", "background_shape"}:
         return "background"
@@ -431,7 +486,7 @@ def _fallback_candidate_annotation(
         is_text = False
 
     role_l = element_role.lower()
-    is_brand_related = "brand" in role_l or "brand" in ctype
+    is_brand_related = "brand" in role_l or "brand" in ctype or role_l in {"brand_name", "brand_mark", "logo_text", "logo_icon"}
     is_required_for_compliance = "legal" in role_l or "legal" in ctype
 
     reason_short = reason
@@ -578,6 +633,7 @@ class QwenRuntime:
         temperature: float = 0.0,
         use_fp16: bool = True,
         max_image_long_side: int = 1024,
+        vl_family: str = "qwen2_5",
     ) -> None:
         self.model_path = model_path
         self.device = device
@@ -585,12 +641,15 @@ class QwenRuntime:
         self.temperature = temperature
         self.use_fp16 = use_fp16
         self.max_image_long_side = max_image_long_side
+        self.vl_family = vl_family if vl_family in ("qwen2_5", "qwen3") else "qwen2_5"
         self.model = None
         self.processor = None
 
     def load(self) -> None:
-        if AutoProcessor is None or Qwen2_5_VLForConditionalGeneration is None or torch is None:
+        if AutoProcessor is None or torch is None:
             raise RuntimeError("transformers/torch are not installed correctly.")
+        if self.vl_family == "qwen2_5" and Qwen2_5_VLForConditionalGeneration is None:
+            raise RuntimeError("transformers/torch are not installed correctly (Qwen2.5-VL class missing).")
 
         if self.device.startswith("cuda"):
             device_index = int(self.device.split(":")[1])
@@ -599,12 +658,35 @@ class QwenRuntime:
         dtype = torch.float16 if (self.use_fp16 and self.device.startswith("cuda")) else torch.float32
 
         self.processor = AutoProcessor.from_pretrained(self.model_path, trust_remote_code=True)
-        self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            self.model_path,
-            torch_dtype=dtype,
-            trust_remote_code=True,
-        ).to(self.device)
+        if self.vl_family == "qwen3":
+            try:
+                from transformers import Qwen3VLForConditionalGeneration
+            except ImportError as exc:
+                raise RuntimeError(
+                    "Qwen3-VL requires a recent transformers (e.g. pip install 'transformers>=4.52,<5')."
+                ) from exc
+            logger.info("Loading Qwen3-VL from %s", self.model_path)
+            self.model = Qwen3VLForConditionalGeneration.from_pretrained(
+                self.model_path,
+                dtype=dtype,
+                trust_remote_code=True,
+            ).to(self.device)
+        else:
+            logger.info("Loading Qwen2.5-VL from %s", self.model_path)
+            self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                self.model_path,
+                dtype=dtype,
+                trust_remote_code=True,
+            ).to(self.device)
         self.model.eval()
+        _ready = (
+            f"qwen-figma-service model ready: vl_family={self.vl_family} "
+            f"model_path={self.model_path!r} device={self.device!r} "
+            f"dtype={dtype} class={type(self.model).__name__}"
+        )
+        print(_ready, flush=True)
+        print(_ready, file=sys.stderr, flush=True)
+        logger.info("%s", _ready)
         if self.temperature <= 0 and hasattr(self.model, "generation_config"):
             self.model.generation_config.do_sample = False
             for attr in ("temperature", "top_p", "top_k"):
@@ -1220,16 +1302,31 @@ Rules (critical):
 - Treat the Figma summary as the source of truth for structure. Do NOT invent node ids or candidate_ids.
 - Only emit keys in "element_annotations" for candidate_ids listed in element_annotation_candidate_ids.
 - Only emit keys in "group_annotations" for candidate_ids listed in group_annotation_candidate_ids.
-- If uncertain about a candidate, keep the heuristic_role as element_role or use "unknown".
-- Prefer fewer, high-confidence annotations; do not label every decoration as functional.
+- Return `element_annotations` for every candidate id listed in `element_annotation_candidate_ids`.
+- Return `group_annotations` for every candidate id listed in `group_annotation_candidate_ids`.
+- Do not return empty `element_annotations` or `group_annotations` unless the corresponding allowed-id list is empty.
+- If uncertain about a candidate, keep the heuristic_role as element_role, but still fill a specific semantic_name when the visual/text function is clear.
+- Prefer high-confidence corrections, but do not silently accept wrong heuristic labels when the banner image or atlas disproves them.
 - Do not over-label large background shapes as headline/CTA.
 
 Allowed element_role values:
-headline, subheadline, body_text, legal, price_main, price_old, price_fraction,
+headline, subheadline, offer_headline, offer_price_phrase, price, body_text, legal,
+price_main, price_old, price_fraction,
 discount_text, cta, label, badge_text, logo_text,
-product_image, hero_photo, logo_icon, brand_mark, background_shape,
+product_image, hero_photo, logo_icon, brand_mark, brand_name, background_shape,
 background_panel, decoration, discount_badge, age_badge, packshot,
 text_container, image_container, promo_container, unknown
+
+Brand_name: use for visible brand wordmark text even when the brand string is not a known retailer;
+infer from top strip placement, small block vs headline, logo mark adjacency, and group structure.
+Semantic_name: brand_name_<slugified_text> or brand_name_unknown.
+
+Offer vs price: do not set element_role to price_main/price_group for whole sentences that merely contain $, ₽, %, or digits.
+Use offer_headline for promo sentences (optionally with text_spans). Use price for bare amounts (e.g. $0, 169₽).
+Use discount_badge for compact tokens like -52%. Use age_badge for 0+ / 18+ etc.
+
+Optional per-candidate text_spans (list of objects with text, role, semantic_name) on element_annotations
+when a single text layer mixes roles (e.g. offer_quantity, offer_service, offer_price_phrase, price, discount_span).
 
 Allowed functional_type: functional, decorative, background
 Allowed importance_level: critical, high, medium, low
@@ -1299,7 +1396,13 @@ Return JSON only (no markdown fences):
         "anchor_type": "free"
       }},
       "confidence": 0.0,
-      "reason_short": "one short sentence"
+      "reason_short": "one short sentence",
+      "text_spans": [
+        {{"text": "GET 10", "role": "offer_quantity", "semantic_name": "offer_quantity"}},
+        {{"text": "DELIVERIES", "role": "offer_service", "semantic_name": "offer_service"}},
+        {{"text": "FOR $0", "role": "offer_price_phrase", "semantic_name": "offer_price_phrase"}},
+        {{"text": "$0", "role": "price", "semantic_name": "price"}}
+      ]
     }}
   }},
   "group_annotations": {{
@@ -1330,7 +1433,8 @@ Return JSON only (no markdown fences):
       "semantic_name": "...",
       "parent_semantic_name": "",
       "confidence": 0.0,
-      "reason": ""
+      "reason": "",
+      "text_spans": []
     }}
   ],
   "groups": [
@@ -1456,7 +1560,7 @@ Return JSON only (no markdown fences):
             ks = str(k)
             if ks not in elem_allowed or not isinstance(v, dict):
                 continue
-            elem_out[ks] = {
+            row_e: dict[str, Any] = {
                 "element_role": str(v.get("element_role", "unknown")).lower().strip() or "unknown",
                 "semantic_name": str(v.get("semantic_name", "") or "").strip(),
                 "parent_semantic_name": str(v.get("parent_semantic_name", "") or "").strip(),
@@ -1469,6 +1573,10 @@ Return JSON only (no markdown fences):
                 "confidence": float(v.get("confidence", 0.0) or 0.0),
                 "reason_short": str(v.get("reason_short", "")),
             }
+            ts_e = _normalize_scene_text_spans(v.get("text_spans"))
+            if ts_e:
+                row_e["text_spans"] = ts_e
+            elem_out[ks] = row_e
 
         grp_in = data.get("group_annotations") if isinstance(data.get("group_annotations"), dict) else {}
         grp_out: dict[str, Any] = {}
@@ -1591,11 +1699,12 @@ Critical rules:
 - Do NOT invent candidate ids, figma ids, paths, or child ids.
 - Return ONE valid JSON object only. No markdown, no prose, no comments.
 - The response must start with `{{` and end with `}}`.
-- If unsure, keep heuristic semantics or return empty strings/empty arrays.
+- If unsure, keep heuristic semantics in annotations; do not make the whole response empty.
 - Classify 0+, 3+, 6+, 12+, 16+, 18+ as age_badge, never as price_group.
 - Only use price_group when text clearly contains real pricing markers like ₽, $, €, руб, %, скид, от, numeric price formats.
-- If multiple nearby stars/sparkles belong to one decorative family, use one decoration_group.
-- For a decoration group candidate whose `grouping_reason` is `star_family_global` (or all `source_node_ids` are star shapes), every Figma `source_node_id` must appear exactly once in `updates` with a distinct `semantic_name` from the banner image: use `star_straight` or `star_rotated` for a single star. If two or more stars share the same orientation (all upright vs all tilted), use `star_straight_1`, `star_straight_2`, … or `star_rotated_1`, `star_rotated_2`, … Use mixed forms (`star_straight`, `star_rotated`) when orientations differ. Do not emit separate decoration groups per star; keep one `group_annotations` entry for that decoration candidate with `semantic_name` `decoration_group`.
+- If multiple nearby stars belong to one decorative family, use one group with `semantic_name` **`decoration_star_group`** (not `decoration_group`). For loose sparkles mixed with non-stars, use `decoration_group`.
+- For a decoration group candidate whose `grouping_reason` is `star_family_global` (or all `source_node_ids` are star shapes), every Figma `source_node_id` must appear exactly once in `updates` with a distinct `semantic_name` from the banner image: use `star_straight` or `star_rotated` for a single star. If two or more stars share the same orientation (all upright vs all tilted), use `star_straight_1`, `star_straight_2`, … or `star_rotated_1`, `star_rotated_2`, … Use mixed forms (`star_straight`, `star_rotated`) when orientations differ. Do not emit separate decoration groups per star; keep one `group_annotations` entry for that star cluster with `semantic_name` **`decoration_star_group`**.
+- Never use `decoration_group` as the group `semantic_name` for clusters that are only logo + `brand_name_*` vector/text parts—those must use **`brand_group`**.
 - Brand/logo naming must adapt to the current design: if the mark is not M-shaped, do not call it logo_m. Use logo_heart, logo_leaf, or logo_mark when appropriate.
 - For fragmented brand text like Я + ндекс or Ya + ndex, name parts adaptively using brand_name_yandex_part, brand_name_market_part, brand_name_lavka_part when needed.
 - Prefer short semantic names suitable for Figma layer names.
@@ -1611,7 +1720,7 @@ hero_group, hero_item, hero_person, product_item, product_food, product_drink,
 background_group, background_color, background_shape, background_gradient, visual_asset
 
 Allowed group semantic_name examples:
-brand_group, headline_group, legal_group, badge_group, decoration_group, hero_group, background_group
+brand_group, headline_group, legal_group, badge_group, decoration_group, decoration_star_group, hero_group, background_group
 
 Compact banner metadata JSON:
 {_prompt_json(request.banner_metadata)}
@@ -1691,7 +1800,8 @@ Return this JSON shape only:
       "semantic_name": "...",
       "parent_semantic_name": "",
       "confidence": 0.0,
-      "reason": ""
+      "reason": "",
+      "text_spans": []
     }}
   ],
   "groups": [
@@ -1717,6 +1827,82 @@ Return this JSON shape only:
         out = self._semantic_structure_heuristic_fallback(figma_summary)
         out["semantic_relations"] = []
         out["layout_constraints"] = []
+        return out
+
+    def _scene_update_semantic_name_from_annotation(self, ann: dict[str, Any]) -> str:
+        semantic_name = str(ann.get("semantic_name", "") or "").strip()
+        if semantic_name:
+            return semantic_name
+        role = str(ann.get("element_role", "") or "").lower().strip()
+        mapping = {
+            "headline": "headline",
+            "offer_headline": "offer_headline",
+            "subheadline": "subheadline",
+            "legal": "legal_text",
+            "age_badge": "age_badge",
+            "discount_badge": "discount_badge",
+            "price": "price",
+            "price_main": "price",
+            "price_old": "price_old",
+            "price_fraction": "price_fraction",
+            "brand_name": "brand_name_unknown",
+            "brand_mark": "logo_mark",
+            "logo_text": "brand_name_unknown",
+            "logo_icon": "logo_mark",
+            "product_image": "product_item",
+            "hero_photo": "hero_image",
+            "background_shape": "background_shape",
+            "background_panel": "background_shape",
+            "decoration": "decoration",
+        }
+        return mapping.get(role, "")
+
+    def _synthesize_scene_updates_from_element_annotations(
+        self,
+        *,
+        figma_summary: dict[str, Any],
+        element_annotations: dict[str, Any],
+        node_by_id: dict[str, dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Make candidate-level Qwen annotations actionable for layer renaming."""
+        if not element_annotations:
+            return []
+        candidates = {
+            str(c.get("candidate_id", "") or ""): c
+            for c in (figma_summary.get("candidates") or [])
+            if isinstance(c, dict) and c.get("candidate_id")
+        }
+        out: list[dict[str, Any]] = []
+        for cid, ann in element_annotations.items():
+            if not isinstance(ann, dict):
+                continue
+            cand = candidates.get(str(cid))
+            if not cand:
+                continue
+            source_ids = [str(x) for x in (cand.get("source_node_ids") or []) if str(x)]
+            if not source_ids:
+                continue
+            role = str(ann.get("element_role", "unknown") or "unknown").lower().strip()
+            semantic_name = self._scene_update_semantic_name_from_annotation(ann)
+            if role == "unknown" and not semantic_name:
+                continue
+            for sid in source_ids:
+                node = node_by_id.get(sid)
+                if not node:
+                    continue
+                row: dict[str, Any] = {
+                    "source_figma_id": sid,
+                    "path": str(node.get("path", "") or ""),
+                    "role": role,
+                    "semantic_name": semantic_name,
+                    "parent_semantic_name": str(ann.get("parent_semantic_name", "") or "").strip(),
+                    "confidence": float(ann.get("confidence", 0.0) or 0.0),
+                    "reason": str(ann.get("reason_short", "") or "Synthesized from Qwen element annotation."),
+                }
+                ts = _normalize_scene_text_spans(ann.get("text_spans"))
+                if ts:
+                    row["text_spans"] = ts
+                out.append(row)
         return out
 
     def _finalize_scene_response(
@@ -1749,16 +1935,25 @@ Return this JSON shape only:
                 continue
             if path and path not in node_by_path:
                 continue
-            normalized_updates.append(
-                {
-                    "source_figma_id": source_figma_id,
-                    "path": path,
-                    "role": str(item.get("role", "unknown") or "unknown").lower().strip(),
-                    "semantic_name": str(item.get("semantic_name", "") or "").strip(),
-                    "parent_semantic_name": str(item.get("parent_semantic_name", "") or "").strip(),
-                    "confidence": float(item.get("confidence", 0.0) or 0.0),
-                    "reason": str(item.get("reason", "") or "").strip(),
-                }
+            row_u: dict[str, Any] = {
+                "source_figma_id": source_figma_id,
+                "path": path,
+                "role": str(item.get("role", "unknown") or "unknown").lower().strip(),
+                "semantic_name": str(item.get("semantic_name", "") or "").strip(),
+                "parent_semantic_name": str(item.get("parent_semantic_name", "") or "").strip(),
+                "confidence": float(item.get("confidence", 0.0) or 0.0),
+                "reason": str(item.get("reason", "") or "").strip(),
+            }
+            ts_u = _normalize_scene_text_spans(item.get("text_spans"))
+            if ts_u:
+                row_u["text_spans"] = ts_u
+            normalized_updates.append(row_u)
+
+        if not normalized_updates:
+            normalized_updates = self._synthesize_scene_updates_from_element_annotations(
+                figma_summary=figma_summary,
+                element_annotations=out.get("element_annotations") or {},
+                node_by_id=node_by_id,
             )
 
         normalized_groups: list[dict[str, Any]] = []
@@ -1869,20 +2064,29 @@ def create_app(
     max_new_tokens: int = 768,
     temperature: float = 0.0,
     max_image_long_side: int = 1024,
+    vl_family: str | None = None,
 ) -> FastAPI:
     app = FastAPI(title="Qwen Layout Annotation Service")
+    resolved_family = resolve_qwen_vl_family(model_path, vl_family)
     runtime = QwenRuntime(
         model_path=model_path,
         device=device,
         max_new_tokens=max_new_tokens,
         temperature=temperature,
         max_image_long_side=max_image_long_side,
+        vl_family=resolved_family,
     )
     runtime.load()
 
     @app.get("/health", response_model=HealthResponse)
     def health() -> HealthResponse:
-        return HealthResponse(status="ok", model_loaded=(runtime.model is not None and runtime.processor is not None), device=runtime.device, model_path=runtime.model_path)
+        return HealthResponse(
+            status="ok",
+            model_loaded=(runtime.model is not None and runtime.processor is not None),
+            device=runtime.device,
+            model_path=runtime.model_path,
+            vl_family=runtime.vl_family,
+        )
 
     @app.post("/annotate/brand-context")
     def annotate_brand_context(request: BrandContextAnnotateRequest) -> dict[str, Any]:

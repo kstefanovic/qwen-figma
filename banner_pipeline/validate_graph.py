@@ -175,7 +175,8 @@ def _validate_zone_bbox_contains_groups(graph: SemanticGraph, warnings: list[Val
 def _validate_critical_presence(graph: SemanticGraph, warnings: list[ValidationIssue]) -> None:
     roles = {e.role for e in graph.elements}
     group_roles = {g.role for g in graph.groups}
-    if ElementRole.HEADLINE not in roles and GroupRole.HEADLINE_GROUP not in group_roles and GroupRole.TEXT_GROUP not in group_roles:
+    headline_like_roles = {ElementRole.HEADLINE, ElementRole.OFFER_HEADLINE}
+    if not (roles & headline_like_roles) and GroupRole.HEADLINE_GROUP not in group_roles and GroupRole.TEXT_GROUP not in group_roles:
         _add_warning(warnings, "missing_headline", "Graph has no obvious headline or headline-like group.")
     if GroupRole.BRAND_GROUP not in group_roles:
         _add_warning(warnings, "missing_brand_group", "Graph has no brand_group.")
@@ -218,10 +219,13 @@ def _validate_suspicious_overlaps(graph: SemanticGraph, warnings: list[Validatio
     important_text_roles = {
         ElementRole.HEADLINE,
         ElementRole.SUBHEADLINE,
+        ElementRole.OFFER_HEADLINE,
         ElementRole.LEGAL,
         ElementRole.PRICE_MAIN,
         ElementRole.PRICE_OLD,
         ElementRole.PRICE_FRACTION,
+        ElementRole.PRICE,
+        ElementRole.BRAND_NAME,
     }
     candidates = [e for e in graph.elements if e.role in important_text_roles]
 

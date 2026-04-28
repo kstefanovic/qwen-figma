@@ -71,61 +71,19 @@ async function exportFramePngBytes(node) {
   });
 }
 
-/**
- * Walk the frame tree (same ``path`` convention as ``serializeNode``) and collect
- * every IMAGE paint reference. Returns unique hashes plus placement metadata for the backend.
- */
-function collectImagePaintRefs(root) {
-  const refs = [];
-  const hashes = new Set();
+/** Max leaves packed into the element atlas. Keep in sync with backend MAX_ATLAS_REGIONS. */
+const MAX_ELEMENT_LAYER_PNGS = 512;
 
-  function imageHashFromPaint(paint) {
-    if (!paint || paint.visible === false) return null;
-    const pt = String(paint.type || "").toUpperCase();
-    if (pt !== "IMAGE") return null;
-    const h = paint.imageHash || paint.imageRef;
-    return typeof h === "string" && h.length > 0 ? h : null;
-  }
-
-  function walkPaints(node, path, paints, role) {
-    if (!paints || paints === figma.mixed || !Array.isArray(paints)) return;
-    for (const paint of paints) {
-      const ih = imageHashFromPaint(paint);
-      if (!ih) continue;
-      hashes.add(ih);
-      refs.push({
-        path,
-        node_id: node.id,
-        name: node.name,
-        type: normalizeType(node.type),
-        image_hash: ih,
-        fill_role: role
-      });
-    }
-  }
-
-  function visit(node, path) {
-    if ("fills" in node) walkPaints(node, path, node.fills, "fill");
-    if ("strokes" in node) walkPaints(node, path, node.strokes, "stroke");
-    if ("children" in node && node.children) {
-      node.children.forEach((child, index) => {
-        const childPath = path === "" ? String(index) : `${path}/${index}`;
-        visit(child, childPath);
-      });
-    }
-  }
-
-  visit(root, "");
-  return { refs, hashes };
-}
-
-/** Max leaves packed into the element atlas (same cap as before). */
-const MAX_ELEMENT_LAYER_PNGS = 250;
-
-/** Space between atlas cells (after each cell on the row, and between rows). Larger = easier to scan atlas.png. */
-const ATLAS_GAP = 12;
+/** Space between element bounding boxes. Requested as 20x the previous 12px spacing. */
+const PREVIOUS_ATLAS_GAP = 12;
+const ATLAS_GAP = PREVIOUS_ATLAS_GAP * 20;
+const ATLAS_CELL_PADDING = Math.round(ATLAS_GAP / 2);
 const ATLAS_MAX_ROW_WIDTH = 8192;
 const ATLAS_MAX_CELL = 4096;
+const ELEMENTS_PNG_MAX_WIDTH = 1920;
+const ELEMENTS_PNG_MAX_HEIGHT = 1028;
+const ATLAS_BOX_COLOR = { r: 1, g: 0, b: 0 };
+const ATLAS_CELL_COLOR = { r: 1, g: 1, b: 1 };
 
 /**
  * Collect **leaf** scene nodes (same rules as former per-PNG export): no children
@@ -164,19 +122,69 @@ function collectLeafElementRefs(root, maxCount) {
     if (count >= maxCount) break;
   }
   if (count >= maxCount) {
-    console.warn("collectLeafElementRefs: hit MAX_ELEMENT_LAYER_PNGS", maxCount);
+    console.warn("collectLeafElementRefs: hit backend atlas-region cap", maxCount);
   }
   return out;
 }
 
+function atlasExportScale(width, height) {
+  const w = Math.max(1, Number(width) || 1);
+  const h = Math.max(1, Number(height) || 1);
+  return Math.min(1, ELEMENTS_PNG_MAX_WIDTH / w, ELEMENTS_PNG_MAX_HEIGHT / h);
+}
+
+function scaledRegionValue(value, scale) {
+  return Math.max(0, Math.round((Number(value) || 0) * scale));
+}
+
+function scaledRegionSize(value, scale) {
+  return Math.max(1, Math.round((Number(value) || 0) * scale));
+}
+
+function makeBoundingBoxRect(x, y, width, height, exportScale) {
+  const rect = figma.createRectangle();
+  rect.name = "__element_bbox__";
+  rect.x = x;
+  rect.y = y;
+  rect.resizeWithoutConstraints(Math.max(1, width), Math.max(1, height));
+  rect.fills = [];
+  rect.strokes = [{ type: "SOLID", color: ATLAS_BOX_COLOR }];
+  rect.strokeWeight = Math.max(4, 6 / Math.max(exportScale, 0.01));
+  rect.strokeAlign = "INSIDE";
+  return rect;
+}
+
+function makeAtlasCellFrame(x, y, width, height) {
+  const cell = figma.createFrame();
+  cell.name = "__element_cell__";
+  cell.x = x;
+  cell.y = y;
+  cell.layoutMode = "NONE";
+  cell.clipsContent = true;
+  cell.fills = [
+    {
+      type: "SOLID",
+      color: ATLAS_CELL_COLOR,
+      opacity: 0.04,
+    },
+  ];
+  cell.resizeWithoutConstraints(Math.max(1, width), Math.max(1, height));
+  return cell;
+}
+
 /**
- * Clone leaves into one off-screen frame, pack in rows, export a **single** PNG atlas.
- * Returns Base64 PNG + region list (pixel coords in that PNG). Names/paths match ``raw_json``.
+ * Clone leaves into one off-screen frame, pack in rows with large spacing, draw visible
+ * bounding boxes, and export a **single** PNG atlas capped to 1920 x 1028.
+ * Returns Base64 PNG + region list in final exported pixel coords. Names/paths match ``raw_json``.
  */
 async function buildElementAtlasPngAndRegions(root, maxCount) {
   const entries = collectLeafElementRefs(root, maxCount);
   if (!entries.length) {
-    return { atlasPngBase64: "", regions: [] };
+    return {
+      atlasPngBase64: "",
+      regions: [],
+      atlasSize: { width: 0, height: 0, source_width: 0, source_height: 0, scale: 1 },
+    };
   }
 
   const atlas = figma.createFrame();
@@ -188,7 +196,8 @@ async function buildElementAtlasPngAndRegions(root, maxCount) {
   atlas.x = -120000;
   atlas.y = -120000;
 
-  const regions = [];
+  const layoutRegions = [];
+  const bboxRects = [];
   let curX = 0;
   let curY = 0;
   let rowH = 0;
@@ -202,8 +211,6 @@ async function buildElementAtlasPngAndRegions(root, maxCount) {
         console.warn("buildElementAtlas: clone failed", path, e);
         continue;
       }
-
-      atlas.appendChild(clone);
 
       try {
         if ("resizeWithoutConstraints" in clone && typeof clone.resizeWithoutConstraints === "function") {
@@ -219,46 +226,87 @@ async function buildElementAtlasPngAndRegions(root, maxCount) {
 
       const cw = clone.width;
       const ch = clone.height;
+      const cellW = cw + ATLAS_CELL_PADDING * 2;
+      const cellH = ch + ATLAS_CELL_PADDING * 2;
 
-      if (curX + cw + ATLAS_GAP > ATLAS_MAX_ROW_WIDTH && curX > 0) {
+      if (curX + cellW + ATLAS_GAP > ATLAS_MAX_ROW_WIDTH && curX > 0) {
         curY += rowH + ATLAS_GAP;
         curX = 0;
         rowH = 0;
       }
 
-      clone.x = curX;
-      clone.y = curY;
+      const cell = makeAtlasCellFrame(curX, curY, cellW, cellH);
+      atlas.appendChild(cell);
+      cell.appendChild(clone);
+      clone.x = ATLAS_CELL_PADDING;
+      clone.y = ATLAS_CELL_PADDING;
+      const bboxRect = makeBoundingBoxRect(ATLAS_CELL_PADDING, ATLAS_CELL_PADDING, cw, ch, 1);
+      cell.appendChild(bboxRect);
+      bboxRects.push(bboxRect);
 
-      regions.push({
+      layoutRegions.push({
         path,
         node_id: node.id,
         name: node.name,
         type: normalizeType(node.type),
-        atlas_x: Math.round(curX),
-        atlas_y: Math.round(curY),
+        atlas_x: Math.round(curX + ATLAS_CELL_PADDING),
+        atlas_y: Math.round(curY + ATLAS_CELL_PADDING),
         atlas_width: Math.round(cw),
         atlas_height: Math.round(ch),
+        cell_x: Math.round(curX),
+        cell_y: Math.round(curY),
+        cell_width: Math.round(cellW),
+        cell_height: Math.round(cellH),
       });
 
-      curX += cw + ATLAS_GAP;
-      rowH = Math.max(rowH, ch);
+      curX += cellW + ATLAS_GAP;
+      rowH = Math.max(rowH, cellH);
     }
 
     let maxR = 0;
     let maxB = 0;
-    for (const c of atlas.children) {
-      maxR = Math.max(maxR, c.x + c.width);
-      maxB = Math.max(maxB, c.y + c.height);
+    for (const region of layoutRegions) {
+      maxR = Math.max(maxR, region.cell_x + region.cell_width);
+      maxB = Math.max(maxB, region.cell_y + region.cell_height);
     }
+    const finalW = Math.max(1, Math.ceil(maxR));
+    const finalH = Math.max(1, Math.ceil(maxB));
+    const scale = atlasExportScale(finalW, finalH);
+    for (const bboxRect of bboxRects) {
+      bboxRect.strokeWeight = Math.max(4, 6 / Math.max(scale, 0.01));
+    }
+
     if ("resizeWithoutConstraints" in atlas) {
-      atlas.resizeWithoutConstraints(Math.max(1, Math.ceil(maxR)), Math.max(1, Math.ceil(maxB)));
+      atlas.resizeWithoutConstraints(finalW, finalH);
     }
 
     const bytes = await atlas.exportAsync({
       format: "PNG",
-      constraint: { type: "SCALE", value: 1 },
+      constraint: { type: "SCALE", value: scale },
     });
-    return { atlasPngBase64: uint8ToBase64(bytes), regions };
+    const regions = layoutRegions.map((region) => ({
+      ...region,
+      atlas_x: scaledRegionValue(region.atlas_x, scale),
+      atlas_y: scaledRegionValue(region.atlas_y, scale),
+      atlas_width: scaledRegionSize(region.atlas_width, scale),
+      atlas_height: scaledRegionSize(region.atlas_height, scale),
+      atlas_cell_x: scaledRegionValue(region.cell_x, scale),
+      atlas_cell_y: scaledRegionValue(region.cell_y, scale),
+      atlas_cell_width: scaledRegionSize(region.cell_width, scale),
+      atlas_cell_height: scaledRegionSize(region.cell_height, scale),
+      atlas_scale: Number(scale.toFixed(6)),
+    }));
+    return {
+      atlasPngBase64: uint8ToBase64(bytes),
+      regions,
+      atlasSize: {
+        width: scaledRegionSize(finalW, scale),
+        height: scaledRegionSize(finalH, scale),
+        source_width: finalW,
+        source_height: finalH,
+        scale: Number(scale.toFixed(6)),
+      },
+    };
   } finally {
     atlas.remove();
   }
@@ -293,6 +341,23 @@ function injectAtlasRegionsIntoRawJson(rawJson, regions) {
   }
 
   walk(rawJson);
+}
+
+function attachAtlasMetadataToRawJson(rawJson, atlasSize, regions) {
+  if (!rawJson || typeof rawJson !== "object") return;
+  rawJson.element_atlas = {
+    file_name: "elements.png",
+    max_width: ELEMENTS_PNG_MAX_WIDTH,
+    max_height: ELEMENTS_PNG_MAX_HEIGHT,
+    width: atlasSize && atlasSize.width ? atlasSize.width : 0,
+    height: atlasSize && atlasSize.height ? atlasSize.height : 0,
+    source_width: atlasSize && atlasSize.source_width ? atlasSize.source_width : 0,
+    source_height: atlasSize && atlasSize.source_height ? atlasSize.source_height : 0,
+    scale: atlasSize && atlasSize.scale ? atlasSize.scale : 1,
+    region_count: Array.isArray(regions) ? regions.length : 0,
+    bbox_gap_px: ATLAS_GAP,
+    bbox_style: "red stroke inside each element region",
+  };
 }
 
 function uint8ToBase64(bytes) {
@@ -499,6 +564,9 @@ function deriveContainerSemanticName(itemOrName) {
   }
   if (base === "age_badge") return "badge_group";
   if (base.indexOf("product_") === 0 || base.indexOf("hero_") === 0) return "hero_group";
+  if (base === "decoration_star" || /^decoration_star(_\d+)?$/.test(base)) {
+    return "decoration_star_group";
+  }
   if (base.indexOf("decoration_") === 0) return "decoration_group";
   if (base.indexOf("background_") === 0) return "background_group";
   return null;
@@ -834,31 +902,28 @@ figma.ui.onmessage = async (msg) => {
     const stampedNodeCount = stampOriginalNodeIds(selectedFrame);
     console.log("Number of original nodes stamped:", stampedNodeCount);
 
-    postStatus("Step 1/6: Serializing selected frame...");
+    postStatus("Step 1/5: Serializing selected frame...");
 
     let rawJson = serializeNode(selectedFrame, origin, "");
     rawJson.templateId = "figma_plugin";
 
-    postStatus("Step 2/6: Exporting banner PNG...");
+    postStatus("Step 2/5: Exporting banner.png...");
     const pngBytes = await exportFramePngBytes(selectedFrame);
 
-    postStatus("Step 3/6: Encoding banner PNG...");
+    postStatus("Step 3/5: Encoding banner.png...");
     const pngBase64 = uint8ToBase64(pngBytes);
 
-    postStatus("Step 4/6: Indexing IMAGE fills (metadata only)...");
-    const { refs: elementImageRefs } = collectImagePaintRefs(selectedFrame);
-    console.log("Element image refs:", elementImageRefs.length);
-
-    postStatus("Step 5/6: Building element atlas PNG (all leaves in one image)…");
-    const { atlasPngBase64: elementAtlasPngBase64, regions: elementAtlasRegions } =
+    postStatus("Step 4/5: Building elements.png with visible bounding boxes…");
+    const {
+      atlasPngBase64: elementAtlasPngBase64,
+      regions: elementAtlasRegions,
+      atlasSize: elementAtlasSize,
+    } =
       await buildElementAtlasPngAndRegions(selectedFrame, MAX_ELEMENT_LAYER_PNGS);
     injectAtlasRegionsIntoRawJson(rawJson, elementAtlasRegions);
+    attachAtlasMetadataToRawJson(rawJson, elementAtlasSize, elementAtlasRegions);
     console.log("Element atlas regions:", elementAtlasRegions.length);
-    if (elementAtlasRegions.length > 32) {
-      console.warn(
-        "Atlas has more than 32 leaves; this backend sends only the first 32 crops to Qwen/VLM (see API_CONVERT_CONTRACT.md).",
-      );
-    }
+    console.log("elements.png size:", elementAtlasSize);
 
     let targetWidth = selectedFrame.width;
     let targetHeight = selectedFrame.height;
@@ -872,7 +937,7 @@ figma.ui.onmessage = async (msg) => {
     const requestUrl = `${msg.backendUrl}/api/convert`;
     console.log("Calling backend:", requestUrl);
 
-    postStatus("Step 6/6: Calling backend...");
+    postStatus("Step 5/5: Calling backend...");
 
     const requestedMode = String(msg.convertMode || "apply_to_clone_fast").trim();
     const useQwen = requestedMode === "apply_to_clone_vlm";
@@ -889,11 +954,9 @@ figma.ui.onmessage = async (msg) => {
         target_height: targetHeight,
         mode: requestedMode || "apply_to_clone_fast",
         use_qwen: useQwen,
-        element_image_refs: elementImageRefs,
         element_atlas_png_base64: elementAtlasPngBase64,
         element_atlas_regions: elementAtlasRegions,
         element_atlas_regions_count: elementAtlasRegions.length,
-        element_image_refs_count: elementImageRefs.length,
       };
       if (qwenMode) {
         requestBody.qwen_mode = qwenMode;
@@ -921,7 +984,7 @@ figma.ui.onmessage = async (msg) => {
         elementAtlasRegions.length,
       );
       postStatus(
-        `Sending ~${approxMb} MB (2 PNG fields: banner + atlas, ${elementAtlasRegions.length} atlas regions)…`,
+        `Sending ~${approxMb} MB (banner.png + elements.png + raw JSON, ${elementAtlasRegions.length} boxes)…`,
       );
 
       response = await fetch(requestUrl, {

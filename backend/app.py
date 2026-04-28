@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from env_load import default_qwen_base_url, load_project_env
 
 load_project_env()
@@ -18,6 +19,7 @@ MAX_ELEMENT_REFERENCE_PNGS = 32
 _MIN_DECODED_RASTER_BYTES = 24
 
 import requests
+import sys
 from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -34,7 +36,6 @@ from backend.schemas import (
     ConvertSemanticSummary,
     LayoutUpdateItem,
     HealthResponse,
-    MAX_ATLAS_REGIONS,
     RunCreateResponse,
     RunListItem,
     RunListResponse,
@@ -110,166 +111,75 @@ def _decode_base64_to_raster_png_bytes(data: str, *, field_label: str) -> bytes:
     return out
 
 
-def _crop_atlas_region_to_png_bytes(
-    atlas_im: Image.Image, *, x: int, y: int, w: int, h: int, idx: int
-) -> bytes:
-    aw, ah = atlas_im.size
-    if w <= 0 or h <= 0:
-        raise ValueError(f"element_atlas_regions[{idx}]: width and height must be positive.")
-    if x < 0 or y < 0 or x + w > aw or y + h > ah:
-        raise ValueError(
-            f"element_atlas_regions[{idx}]: crop box ({x}, {y}, {w}, {h}) "
-            f"is outside atlas bounds ({aw}, {ah})."
-        )
-    crop = atlas_im.crop((x, y, x + w, y + h))
-    rgb = crop.convert("RGB")
-    buf = io.BytesIO()
-    rgb.save(buf, format="PNG", optimize=True)
-    out = buf.getvalue()
-    if len(out) < 32:
-        raise ValueError(f"element_atlas_regions[{idx}]: cropped PNG output is unexpectedly small.")
-    return out
-
-
-def _atlas_regions_from_raw_json(raw: Any) -> list[dict[str, Any]]:
-    """Collect atlas_region {x,y,width,height} from any depth; order is tree walk order."""
-    acc: list[dict[str, Any]] = []
-
-    def walk(o: Any) -> None:
-        if len(acc) >= MAX_ATLAS_REGIONS:
-            return
-        if isinstance(o, dict):
-            ar = o.get("atlas_region")
-            if isinstance(ar, dict):
-                try:
-                    x = int(ar["x"])
-                    y = int(ar["y"])
-                    w = int(ar["width"])
-                    h = int(ar["height"])
-                except (KeyError, TypeError, ValueError):
-                    pass
-                else:
-                    if w > 0 and h > 0 and x >= 0 and y >= 0:
-                        acc.append(
-                            {
-                                "path": o.get("path"),
-                                "node_id": o.get("node_id") or o.get("id"),
-                                "name": o.get("name"),
-                                "type": o.get("type"),
-                                "atlas_x": x,
-                                "atlas_y": y,
-                                "atlas_width": w,
-                                "atlas_height": h,
-                                "from_raw_json_atlas_region": True,
-                            }
-                        )
-            for v in o.values():
-                walk(v)
-        elif isinstance(o, list):
-            for item in o:
-                walk(item)
-
-    walk(raw)
-    return acc
-
-
-def _effective_atlas_crop_rows(body: ConvertRequest) -> list[dict[str, Any]]:
-    """Prefer element_atlas_regions; if atlas is set but the list is empty, use raw_json atlas_region."""
-    from_regions = [r.model_dump() for r in (body.element_atlas_regions or [])]
-    atlas_b64 = (body.element_atlas_png_base64 or "").strip()
-    if atlas_b64 and not from_regions:
-        return _atlas_regions_from_raw_json(body.raw_json)
-    return from_regions
-
-
 def _save_convert_plugin_element_assets(run_id: str, body: ConvertRequest) -> dict[str, Any]:
     """
-    Decode element atlas PNG to elements/atlas.png, crop leaves from element_atlas_regions
-    or raw_json atlas_region, persist element_image_refs JSON; Qwen paths are cropped PNGs only.
+    Decode and store the plugin's single atlas PNG only.
+
+    The plugin/backend contract is intentionally three input artifacts:
+    banner.png, atlas.png, and raw.json. Do not materialize per-leaf crops or
+    crop manifests; the scene annotator can receive the full atlas directly.
     """
-    leaf_saved: list[str] = []
-    manifest_rows: list[dict[str, Any]] = []
-    leaf_source: str = "none"
+    atlas_source: str = "none"
     atlas_path: str | None = None
 
     atlas_b64 = (body.element_atlas_png_base64 or "").strip()
-    crop_rows = _effective_atlas_crop_rows(body)
     if atlas_b64:
-        leaf_source = "element_atlas"
-        if not crop_rows:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "element_atlas_png_base64 is non-empty but no crop rectangles were found "
-                    "in element_atlas_regions or raw_json atlas_region."
-                ),
-            )
+        atlas_source = "element_atlas"
         try:
             atlas_png_bytes = _decode_strict_png_base64(
                 atlas_b64, field_label="element_atlas_png_base64"
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from None
-        atlas_path = storage.save_upload_bytes(run_id, "elements/atlas.png", atlas_png_bytes)
-        try:
-            with Image.open(io.BytesIO(atlas_png_bytes)) as atlas_im:
-                atlas_rgb = atlas_im.convert("RGB")
-                for i, row in enumerate(crop_rows[:MAX_ATLAS_REGIONS]):
-                    x = int(row["atlas_x"])
-                    y = int(row["atlas_y"])
-                    w = int(row["atlas_width"])
-                    h = int(row["atlas_height"])
-                    try:
-                        raw = _crop_atlas_region_to_png_bytes(
-                            atlas_rgb, x=x, y=y, w=w, h=h, idx=i
-                        )
-                    except ValueError as e:
-                        raise HTTPException(status_code=400, detail=str(e)) from None
-                    rel = f"elements/leaf_{i:03d}.png"
-                    leaf_saved.append(storage.save_upload_bytes(run_id, rel, raw))
-                    mrow = dict(row)
-                    mrow["saved_as"] = rel
-                    mrow["from_element_atlas"] = True
-                    manifest_rows.append(mrow)
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(
-                status_code=400,
-                detail=f"element_atlas_png_base64: could not open or crop atlas ({e}).",
-            ) from None
-
-    manifest_path: str | None = None
-    if manifest_rows:
-        manifest_path = storage.save_upload_bytes(
-            run_id,
-            "elements/element_atlas_crops_manifest.json",
-            json.dumps(manifest_rows, ensure_ascii=False, indent=2).encode("utf-8"),
-        )
-
-    refs_path: str | None = None
-    if body.element_image_refs:
-        refs_data = [r.model_dump() for r in body.element_image_refs]
-        refs_path = storage.save_upload_bytes(
-            run_id,
-            "elements/element_image_refs.json",
-            json.dumps(refs_data, ensure_ascii=False, indent=2).encode("utf-8"),
-        )
-
-    qwen_paths: list[str] = list(leaf_saved[:MAX_ELEMENT_REFERENCE_PNGS])
+        atlas_path = storage.save_upload_bytes(run_id, "atlas.png", atlas_png_bytes)
 
     return {
-        "qwen_paths": qwen_paths,
-        "manifest_path": manifest_path,
-        "refs_path": refs_path,
+        "qwen_paths": [],
         "atlas_path": atlas_path,
-        "leaf_saved_count": len(leaf_saved),
+        "derived_element_pngs_saved": 0,
         "library_saved_count": 0,
-        "leaf_source": leaf_source,
+        "atlas_source": atlas_source,
     }
 
 
-app = FastAPI(title="Banner Pipeline Backend")
+def _log_qwen_inference_service_at_startup() -> None:
+    """PM2 often tails *-error.log; print to stderr so model identity is visible."""
+    base = QWEN_BASE_URL.rstrip("/")
+    url = f"{base}/health"
+    try:
+        resp = requests.get(url, timeout=25)
+        if not resp.ok:
+            print(
+                f"qwen-figma-backend: Qwen service /health HTTP {resp.status_code} url={url!r}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
+        data = resp.json() if resp.text else {}
+        mp = data.get("model_path", "?")
+        vf = data.get("vl_family", "?")
+        ml = data.get("model_loaded")
+        dev = data.get("device", "?")
+        line = (
+            f"qwen-figma-backend: Qwen inference at {base} — "
+            f"vl_family={vf} model_path={mp!r} model_loaded={ml} device={dev!r}"
+        )
+        print(line, file=sys.stderr, flush=True)
+    except Exception as exc:
+        print(
+            f"qwen-figma-backend: could not reach Qwen service ({url}): {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+@asynccontextmanager
+async def _backend_lifespan(app: FastAPI):
+    _log_qwen_inference_service_at_startup()
+    yield
+
+
+app = FastAPI(title="Banner Pipeline Backend", lifespan=_backend_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -401,9 +311,19 @@ def _resolve_convert_execution(body: ConvertRequest) -> tuple[str, bool, str]:
 @app.get("/api/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     qwen_ok = False
+    qwen_model_path: str | None = None
+    qwen_vl_family: str | None = None
     try:
         resp = requests.get(f"{QWEN_BASE_URL}/health", timeout=10)
         qwen_ok = resp.ok
+        if qwen_ok:
+            try:
+                data = resp.json()
+                if isinstance(data, dict):
+                    qwen_model_path = data.get("model_path")
+                    qwen_vl_family = data.get("vl_family")
+            except Exception:
+                pass
     except Exception:
         qwen_ok = False
 
@@ -412,6 +332,8 @@ def health() -> HealthResponse:
         backend="banner-pipeline-backend",
         qwen_service_ok=qwen_ok,
         qwen_service_base_url=QWEN_BASE_URL,
+        qwen_model_path=qwen_model_path,
+        qwen_vl_family=qwen_vl_family,
     )
 
 
@@ -435,25 +357,18 @@ async def convert_from_plugin(body: ConvertRequest = Body(...)) -> ConvertRespon
     banner_path = storage.save_upload_bytes(run_id, "banner.png", png_bytes)
     raw_json_path = storage.save_upload_bytes(
         run_id,
-        "raw_figma.json",
+        "raw.json",
         json.dumps(body.raw_json, ensure_ascii=False).encode("utf-8"),
     )
 
     assets = _save_convert_plugin_element_assets(run_id, body)
-    element_paths: list[str] = list(assets["qwen_paths"])
 
     input_files: dict[str, Any] = {
         "banner_image": banner_path,
         "raw_json": raw_json_path,
     }
-    if element_paths:
-        input_files["element_images"] = element_paths
     if assets.get("atlas_path"):
         input_files["element_atlas_png"] = assets["atlas_path"]
-    if assets.get("manifest_path"):
-        input_files["element_atlas_crops_manifest"] = assets["manifest_path"]
-    if assets.get("refs_path"):
-        input_files["element_image_refs"] = assets["refs_path"]
 
     storage.update_meta(
         run_id,
@@ -469,11 +384,11 @@ async def convert_from_plugin(body: ConvertRequest = Body(...)) -> ConvertRespon
             "use_qwen": use_qwen,
             "qwen_mode": qwen_mode,
             "plugin_element_atlas_regions_in_json": len(body.element_atlas_regions or []),
-            "plugin_leaf_png_source": assets.get("leaf_source", "none"),
+            "plugin_atlas_source": assets.get("atlas_source", "none"),
             "plugin_element_image_refs_received": len(body.element_image_refs or []),
             "plugin_atlas_png_saved": bool(assets.get("atlas_path")),
-            "plugin_leaf_pngs_saved": assets["leaf_saved_count"],
-            "plugin_qwen_extra_image_count": len(element_paths),
+            "plugin_derived_element_pngs_saved": assets["derived_element_pngs_saved"],
+            "plugin_qwen_extra_image_count": 0,
             "element_atlas_regions_count_declared": body.element_atlas_regions_count,
             "element_image_refs_count_declared": body.element_image_refs_count,
         },
@@ -484,7 +399,7 @@ async def convert_from_plugin(body: ConvertRequest = Body(...)) -> ConvertRespon
             run_id=run_id,
             raw_json_path=raw_json_path,
             banner_image_path=banner_path,
-            element_image_paths=element_paths if element_paths else None,
+            element_image_paths=None,
             atlas_image_path=assets.get("atlas_path"),
             brand_family=brand_family_override,
             language=language_override,

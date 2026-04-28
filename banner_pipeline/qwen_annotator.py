@@ -83,9 +83,10 @@ class CandidateAnnotation:
     confidence: float = 0.0
     reason_short: str = ""
     raw_model_output: str = ""
+    text_spans: Optional[list[dict[str, Any]]] = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "candidate_id": self.candidate_id,
             "element_role": self.element_role,
             "semantic_name": self.semantic_name,
@@ -100,6 +101,9 @@ class CandidateAnnotation:
             "reason_short": self.reason_short,
             "raw_model_output": self.raw_model_output,
         }
+        if self.text_spans:
+            d["text_spans"] = self.text_spans
+        return d
 
 
 @dataclass
@@ -225,6 +229,21 @@ def unpack_semantic_structure_response(data: dict[str, Any]) -> SemanticStructur
         if not isinstance(v, dict):
             continue
         cid_s = str(cid)
+        ts_raw = v.get("text_spans")
+        ts_out: Optional[list[dict[str, Any]]] = None
+        if isinstance(ts_raw, list) and ts_raw:
+            norm: list[dict[str, Any]] = []
+            for item in ts_raw:
+                if not isinstance(item, dict):
+                    continue
+                span_text = str(item.get("text", "") or "")
+                span_role = str(item.get("role", "") or "").strip().lower()
+                if not span_text or not span_role:
+                    continue
+                span_sem = str(item.get("semantic_name", "") or "").strip() or span_role
+                norm.append({"text": span_text, "role": span_role, "semantic_name": span_sem})
+            if norm:
+                ts_out = norm
         candidate_annotations[cid_s] = CandidateAnnotation(
             candidate_id=cid_s,
             element_role=str(v.get("element_role", "unknown")),
@@ -239,6 +258,7 @@ def unpack_semantic_structure_response(data: dict[str, Any]) -> SemanticStructur
             confidence=float(v.get("confidence", 0.0) or 0.0),
             reason_short=str(v.get("reason_short", "")),
             raw_model_output="",
+            text_spans=ts_out,
         )
 
     group_annotations: dict[str, GroupAnnotation] = {}
@@ -397,9 +417,26 @@ class QwenAnnotator:
             "context_padding_ratio": context_padding_ratio,
         }
         data = self._post("/annotate/candidate", payload)
+        ts_raw = data.get("text_spans")
+        ts_out: Optional[list[dict[str, Any]]] = None
+        if isinstance(ts_raw, list) and ts_raw:
+            norm: list[dict[str, Any]] = []
+            for item in ts_raw:
+                if not isinstance(item, dict):
+                    continue
+                span_text = str(item.get("text", "") or "")
+                span_role = str(item.get("role", "") or "").strip().lower()
+                if not span_text or not span_role:
+                    continue
+                span_sem = str(item.get("semantic_name", "") or "").strip() or span_role
+                norm.append({"text": span_text, "role": span_role, "semantic_name": span_sem})
+            if norm:
+                ts_out = norm
         return CandidateAnnotation(
             candidate_id=str(data.get("candidate_id", candidate.candidate_id)),
             element_role=str(data.get("element_role", "unknown")),
+            semantic_name=str(data.get("semantic_name", "")),
+            parent_semantic_name=str(data.get("parent_semantic_name", "")),
             functional_type=str(data.get("functional_type", "functional")),
             importance_level=str(data.get("importance_level", "medium")),
             is_text=data.get("is_text", None),
@@ -409,6 +446,7 @@ class QwenAnnotator:
             confidence=float(data.get("confidence", 0.0) or 0.0),
             reason_short=str(data.get("reason_short", "")),
             raw_model_output=str(data.get("raw_model_output", "")),
+            text_spans=ts_out,
         )
 
     def annotate_group_candidate(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -446,15 +447,19 @@ def _candidate_to_group_role(
         role_to_group = {
             "headline": "headline_group",
             "subheadline": "headline_group",
+            "offer_headline": "headline_group",
             "legal": "legal_group",
             "brand": "brand_group",
+            "brand_name": "brand_group",
             "age_badge": "badge_group",
             "badge": "badge_group",
             "decoration": "decoration_group",
             "background": "background_group",
+            "price": "price_group",
             "price_main": "price_group",
             "price_old": "price_group",
             "price_fraction": "price_group",
+            "offer_price_phrase": "headline_group",
             "product_image": "hero_group",
             "hero_photo": "hero_group",
         }
@@ -513,7 +518,16 @@ def _candidate_to_element_role(
         }
         resolved = by_type.get(candidate.candidate_type, "unknown")
 
-    return _safe_element_role(resolved)
+    role_str = str(resolved or "unknown")
+    has_brand_txt = bool((candidate.text_content or "").strip()) or int(getattr(candidate, "text_count", 0) or 0) > 0
+    if role_str == "brand":
+        role_str = "brand_name" if has_brand_txt else "brand_mark"
+    if candidate.candidate_type == "brand" and has_brand_txt and role_str == "brand_mark":
+        role_str = "brand_name"
+    if candidate.candidate_type == "brand" and not has_brand_txt:
+        role_str = "brand_mark"
+
+    return _safe_element_role(role_str)
 
 
 def _should_make_element(candidate: SemanticCandidate) -> bool:
@@ -528,7 +542,7 @@ def _text_features_from_candidate(candidate: SemanticCandidate) -> Optional[Text
 
 
 def _element_flags_from_role(role: ElementRole) -> tuple[bool, bool]:
-    brand_related_roles = {ElementRole.LOGO_TEXT, ElementRole.LOGO_ICON, ElementRole.BRAND_MARK}
+    brand_related_roles = {ElementRole.LOGO_TEXT, ElementRole.LOGO_ICON, ElementRole.BRAND_MARK, ElementRole.BRAND_NAME}
     compliance_roles = {ElementRole.LEGAL, ElementRole.AGE_BADGE}
     return role in brand_related_roles, role in compliance_roles
 
@@ -558,6 +572,11 @@ def _element_anchor_from_role(role: ElementRole) -> AnchorType:
         ElementRole.LOGO_TEXT: AnchorType.TOP_LEFT,
         ElementRole.LOGO_ICON: AnchorType.TOP_LEFT,
         ElementRole.BRAND_MARK: AnchorType.TOP_LEFT,
+        ElementRole.BRAND_NAME: AnchorType.TOP_LEFT,
+        ElementRole.OFFER_HEADLINE: AnchorType.LEFT_CENTER,
+        ElementRole.OFFER_PRICE_PHRASE: AnchorType.LEFT_CENTER,
+        ElementRole.PRICE: AnchorType.LEFT_CENTER,
+        ElementRole.DISCOUNT_BADGE: AnchorType.TOP_RIGHT,
         ElementRole.DECORATION: AnchorType.FREE,
         ElementRole.BACKGROUND_PANEL: AnchorType.FREE,
         ElementRole.BACKGROUND_SHAPE: AnchorType.FREE,
@@ -567,6 +586,7 @@ def _element_anchor_from_role(role: ElementRole) -> AnchorType:
         ElementRole.PRICE_MAIN: AnchorType.LEFT_CENTER,
         ElementRole.PRICE_OLD: AnchorType.LEFT_CENTER,
         ElementRole.PRICE_FRACTION: AnchorType.LEFT_CENTER,
+        ElementRole.DISCOUNT_TEXT: AnchorType.LEFT_CENTER,
     }
     return mapping.get(role, AnchorType.FREE)
 
@@ -717,6 +737,49 @@ def _index_scene_updates_by_source(updates: list[dict[str, Any]] | None) -> dict
     return out
 
 
+def _slug_for_brand_semantic(text: str) -> str:
+    s = (text or "").strip().lower().replace(" ", "_").replace("-", "_")
+    s = re.sub(r"[^a-z0-9_а-яё]+", "", s, flags=re.IGNORECASE)
+    return s[:80] if s else ""
+
+
+def _normalize_text_spans_list(raw: Any) -> Optional[list[dict[str, Any]]]:
+    if not isinstance(raw, list) or not raw:
+        return None
+    out: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        span_text = str(item.get("text", "") or "")
+        span_role = str(item.get("role", "") or "").strip().lower()
+        if not span_text or not span_role:
+            continue
+        span_sem = str(item.get("semantic_name", "") or "").strip() or span_role
+        out.append({"text": span_text, "role": span_role, "semantic_name": span_sem})
+    return out or None
+
+
+def _merged_text_spans_for_source(
+    source_id: str,
+    update_by_source: dict[str, dict[str, Any]],
+    qwen_ann: Optional[CandidateAnnotation],
+    heuristic_ann: Optional[HeuristicAnnotatedCandidate],
+) -> Optional[list[dict[str, Any]]]:
+    up = update_by_source.get(source_id) or {}
+    ts = _normalize_text_spans_list(up.get("text_spans"))
+    if ts:
+        return ts
+    if qwen_ann is not None:
+        ts = _normalize_text_spans_list(getattr(qwen_ann, "text_spans", None))
+        if ts:
+            return ts
+    if heuristic_ann is not None and isinstance(heuristic_ann.extra_data, dict):
+        ts = _normalize_text_spans_list(heuristic_ann.extra_data.get("text_spans"))
+        if ts:
+            return ts
+    return None
+
+
 def _safe_element_id_suffix(source_figma_id: str) -> str:
     return source_figma_id.replace(":", "_").replace("/", "_")
 
@@ -734,6 +797,8 @@ def _fallback_decoration_member_semantic_name(
         if any(x in tl for x in ("+", "18+", "16+", "12+", "0+", "6+", "3+")):
             return "age_badge"
         if any(x in tl for x in ("₽", "$", "€", "%", "руб", "скид", "от ")):
+            if len(txt) > 40 or txt.count(" ") >= 5:
+                return "headline" if ordinal <= 1 else "subheadline"
             return "price_group"
         if len(txt) > 72:
             return "legal_text"
@@ -892,8 +957,6 @@ def merge_semantic_graph(
         qwen_group_ann = _pick_group_annotation(candidate.candidate_id, qwen_group_annotations)
 
         element_role = _candidate_to_element_role(candidate, heuristic_ann, qwen_candidate_ann, config)
-        if candidate.candidate_type == "brand":
-            element_role = ElementRole.BRAND_MARK
         if candidate.candidate_type == "image_like" and element_role == ElementRole.HERO_PHOTO:
             element_role = ElementRole.PRODUCT_IMAGE
         if candidate.candidate_type == "background" and element_role == ElementRole.UNKNOWN:
@@ -937,10 +1000,17 @@ def merge_semantic_graph(
         role_to_functional = {
             ElementRole.HEADLINE: FunctionalType.FUNCTIONAL,
             ElementRole.SUBHEADLINE: FunctionalType.FUNCTIONAL,
+            ElementRole.OFFER_HEADLINE: FunctionalType.FUNCTIONAL,
+            ElementRole.OFFER_PRICE_PHRASE: FunctionalType.FUNCTIONAL,
+            ElementRole.PRICE: FunctionalType.FUNCTIONAL,
+            ElementRole.PRICE_MAIN: FunctionalType.FUNCTIONAL,
+            ElementRole.PRICE_OLD: FunctionalType.FUNCTIONAL,
+            ElementRole.PRICE_FRACTION: FunctionalType.FUNCTIONAL,
             ElementRole.LEGAL: FunctionalType.FUNCTIONAL,
             ElementRole.LOGO_TEXT: FunctionalType.FUNCTIONAL,
             ElementRole.LOGO_ICON: FunctionalType.FUNCTIONAL,
             ElementRole.BRAND_MARK: FunctionalType.FUNCTIONAL,
+            ElementRole.BRAND_NAME: FunctionalType.FUNCTIONAL,
             ElementRole.AGE_BADGE: FunctionalType.FUNCTIONAL,
             ElementRole.PRODUCT_IMAGE: FunctionalType.FUNCTIONAL,
             ElementRole.HERO_PHOTO: FunctionalType.FUNCTIONAL,
@@ -957,8 +1027,9 @@ def merge_semantic_graph(
             functional_type = FunctionalType.FUNCTIONAL
 
         text_content = candidate.text_content if candidate.text_content else None
+        has_brand_txt = bool((text_content or "").strip()) or int(getattr(candidate, "text_count", 0) or 0) > 0
         if candidate.candidate_type == "brand":
-            is_text = False
+            is_text = bool(has_brand_txt)
         elif qwen_candidate_ann is not None:
             is_text = qwen_candidate_ann.is_text
         else:
@@ -986,6 +1057,7 @@ def merge_semantic_graph(
                 bh = max(float(sub.h_norm), 1e-4)
                 bbox = BBox(x=float(sub.x_norm), y=float(sub.y_norm), w=bw, h=bh)
                 center = [float(sub.x_norm) + bw / 2.0, float(sub.y_norm) + bh / 2.0]
+                ts_sub = _normalize_text_spans_list((update_by_source.get(sid) or {}).get("text_spans"))
                 elements.append(
                     Element(
                         id=f"el_{candidate.candidate_id}_{_safe_element_id_suffix(sid)}",
@@ -1006,6 +1078,7 @@ def merge_semantic_graph(
                         text_content=text_content,
                         text_features=_text_features_from_candidate(candidate),
                         adaptation_policy=adaptation_policy,
+                        text_spans=ts_sub,
                     )
                 )
             continue
@@ -1020,6 +1093,21 @@ def merge_semantic_graph(
             if _scene_semantic_allowed_for_element_role(element_role, q0):
                 sem0 = q0
         semantic_name_single = sem0 or None
+        if element_role == ElementRole.BRAND_NAME and not (semantic_name_single or "").strip():
+            slug = _slug_for_brand_semantic(text_content or "")
+            semantic_name_single = f"brand_name_{slug}" if slug else "brand_name_unknown"
+        if element_role == ElementRole.OFFER_HEADLINE and not (semantic_name_single or "").strip():
+            semantic_name_single = "offer_headline"
+        if element_role == ElementRole.PRICE and not (semantic_name_single or "").strip():
+            semantic_name_single = "price"
+        if element_role == ElementRole.PRICE_MAIN and not (semantic_name_single or "").strip():
+            semantic_name_single = "price"
+        if element_role == ElementRole.PRICE_FRACTION and not (semantic_name_single or "").strip():
+            semantic_name_single = "price_fraction"
+
+        span_list = _merged_text_spans_for_source(
+            source_figma_id, update_by_source, qwen_candidate_ann, heuristic_ann
+        )
 
         elements.append(
             Element(
@@ -1041,6 +1129,7 @@ def merge_semantic_graph(
                 text_content=text_content,
                 text_features=_text_features_from_candidate(candidate),
                 adaptation_policy=adaptation_policy,
+                text_spans=span_list,
             )
         )
 

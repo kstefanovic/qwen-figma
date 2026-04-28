@@ -70,3 +70,7 @@ class HealthResponse(BaseModel):
     model_loaded: bool
     device: str
     model_path: str
+    vl_family: str = Field(
+        default="qwen2_5",
+        description="Vision-language backend: qwen2_5 (Qwen2.5-VL) or qwen3 (Qwen3-VL).",
+    )

@@ -293,6 +293,11 @@ def run_pipeline(
             {
                 "updates": struct.semantic_updates,
                 "groups": struct.semantic_groups,
+                "element_annotations": {k: v.to_dict() for k, v in candidate_annotations.items()},
+                "group_annotations": {k: v.to_dict() for k, v in group_annotations.items()},
+                "brand_context": brand_context_annotation.to_dict(),
+                "banner_annotation": banner_annotation.to_dict(),
+                "raw_model_output": brand_context_annotation.raw_model_output,
             },
             intermediate_dir / "06b_scene_semantics.json",
         )

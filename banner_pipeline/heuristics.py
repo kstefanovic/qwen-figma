@@ -165,22 +165,131 @@ def _looks_like_age_badge_text(candidate: SemanticCandidate) -> bool:
     return bool(re.fullmatch(r"(0|3|6|12|16|18)\+", normalized))
 
 
-def _looks_like_price(candidate: SemanticCandidate) -> bool:
-    text = _safe_text(candidate).lower()
+def _heuristic_offer_text_spans(text: str) -> list[dict[str, str]] | None:
+    """English 'GET N SERVICE FOR $X' → span split for merge / scene JSON."""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    m = re.match(
+        r"^(?P<q>GET\s+\d+)\s+(?P<srv>[A-Za-z]+)\s+(?P<phrase>FOR\s+(\$\d+(?:[.,]\d{1,2})?|[0-9]+\s*₽|[0-9]+₽))\s*$",
+        raw,
+        re.I,
+    )
+    if not m:
+        return None
+    phrase = m.group("phrase").strip()
+    pm = re.search(r"(\$\d+(?:[.,]\d{1,2})?|[0-9]+\s*₽|[0-9]+₽)\s*$", phrase, re.I)
+    price_tok = pm.group(1).strip() if pm else ""
+    spans: list[dict[str, str]] = [
+        {"text": m.group("q").strip(), "role": "offer_quantity", "semantic_name": "offer_quantity"},
+        {"text": m.group("srv").strip(), "role": "offer_service", "semantic_name": "offer_service"},
+        {"text": phrase, "role": "offer_price_phrase", "semantic_name": "offer_price_phrase"},
+    ]
+    if price_tok:
+        spans.append({"text": price_tok, "role": "price", "semantic_name": "price"})
+    return spans
+
+
+def _offer_copy_markers(lower: str) -> bool:
+    return any(
+        tok in lower
+        for tok in (
+            "get ",
+            "buy ",
+            "order ",
+            "заказ",
+            "достав",
+            "delivery",
+            "deliveries",
+            "скид",
+            "бесплат",
+            "free ",
+            "for ",
+            "на первый",
+            "до ",
+            "cashback",
+            "кешбэк",
+            "промо",
+            "promo",
+        )
+    )
+
+
+def _looks_like_offer_promo_headline(candidate: SemanticCandidate) -> bool:
+    if not _is_text_candidate(candidate):
+        return False
+    text = _safe_text(candidate).strip()
     if not text:
         return False
+    lower = text.lower()
+    if _heuristic_offer_text_spans(text):
+        return True
+    wc = _word_count(candidate)
+    if wc >= 4 and ("скид" in lower or "заказ" in lower) and ("%" in text or "₽" in text or "$" in text):
+        return True
+    if wc >= 5 and (_contains_digits(candidate) or "%" in text or "$" in text or "₽" in text) and _offer_copy_markers(lower):
+        return True
+    if re.search(r"\bfor\s+\$", lower) and wc >= 2:
+        return True
+    return False
 
-    normalized = text.replace(" ", "")
-    if re.fullmatch(r"(0|3|6|12|16|18)\+", normalized):
+
+def _looks_like_compact_discount_badge(candidate: SemanticCandidate) -> bool:
+    raw = _safe_text(candidate).strip()
+    if not raw:
         return False
+    if _looks_like_age_badge_text(candidate):
+        return False
+    norm = raw.replace(" ", "")
+    if re.fullmatch(r"-?\d+%", norm):
+        return candidate.area_ratio <= 0.06 or len(raw) <= 8
+    return False
 
-    currency_tokens = ["₽", "$", "€", "руб", "руб.", "сом", "тенге", "₸", "uah", "грн"]
-    has_currency = any(tok in text for tok in currency_tokens)
-    has_digits = _contains_digits(candidate)
-    pricing_tokens = ["от ", "за ", "скид", "%", "sale", "off"]
-    has_pricing_token = any(tok in text for tok in pricing_tokens)
-    numeric_price_pattern = bool(re.search(r"\d[\d\s]*([.,]\d{1,2})?\s*(₽|\$|€|руб|руб\.|₸|грн)", text))
-    return has_digits and (has_currency or has_pricing_token or numeric_price_pattern)
+
+def _looks_like_offer_price_phrase(candidate: SemanticCandidate) -> bool:
+    if _looks_like_pure_price_line(candidate):
+        return False
+    text = _safe_text(candidate).strip()
+    lower = text.lower()
+    if not text:
+        return False
+    if re.search(r"\b(for|от|за)\s+(\$|€|₽|\d)", lower) and _word_count(candidate) <= 5:
+        return True
+    return False
+
+
+def _looks_like_pure_price_line(candidate: SemanticCandidate) -> bool:
+    if _looks_like_offer_promo_headline(candidate):
+        return False
+    text = _safe_text(candidate).strip()
+    if not text:
+        return False
+    if _looks_like_age_badge_text(candidate):
+        return False
+    lower = text.lower()
+    if _word_count(candidate) > 8:
+        return False
+    compact = lower.replace(" ", "").replace("\u00a0", "")
+    if re.fullmatch(r"([\$€₽]|[₽$€]\s*)\d[\d\s,\.]*(\s*(₽|руб|руб\.|₸|грн|uah|\$|€))?", compact):
+        return True
+    if re.fullmatch(r"\d[\d\s,\.]*\s*(₽|руб|руб\.|₸|грн|uah|\$|€)", compact):
+        return True
+    if re.fullmatch(r"\d+[\.,]\d{1,2}", compact) and len(compact) <= 12:
+        return True
+    has_currency = any(tok in lower for tok in ["₽", "$", "€", "руб", "р.", "₸", "грн"])
+    has_digit = _contains_digits(candidate)
+    if has_currency and has_digit and _word_count(candidate) <= 2:
+        return True
+    if has_currency and has_digit and len(text) <= 14:
+        if "for " in lower or "get " in lower or "за " in lower:
+            return False
+        return True
+    return False
+
+
+def _looks_like_price(candidate: SemanticCandidate) -> bool:
+    """Legacy name: true only when the whole block is price-like (not offer copy)."""
+    return _looks_like_pure_price_line(candidate)
 
 
 def _looks_like_discount(candidate: SemanticCandidate) -> bool:
@@ -223,6 +332,10 @@ def _looks_like_headline(candidate: SemanticCandidate) -> bool:
         return False
     if _looks_like_legal(candidate):
         return False
+    if _looks_like_offer_promo_headline(candidate):
+        return False
+    if _looks_like_pure_price_line(candidate):
+        return False
     if _looks_like_price(candidate):
         return False
 
@@ -235,6 +348,10 @@ def _looks_like_subheadline(candidate: SemanticCandidate) -> bool:
     if not _is_text_candidate(candidate):
         return False
     if _looks_like_legal(candidate):
+        return False
+    if _looks_like_offer_promo_headline(candidate):
+        return False
+    if _looks_like_pure_price_line(candidate):
         return False
     if _looks_like_price(candidate):
         return False
@@ -265,7 +382,7 @@ def _sort_text_candidates_by_prominence(candidates: list[SemanticCandidate]) -> 
 
 def _find_best_headline_candidate(candidates: list[SemanticCandidate]) -> SemanticCandidate | None:
     text_candidates = [c for c in candidates if _is_text_candidate(c)]
-    plausible = [c for c in text_candidates if _looks_like_headline(c)]
+    plausible = [c for c in text_candidates if _looks_like_headline(c) and not _looks_like_offer_promo_headline(c)]
     if not plausible:
         return None
     ranked = _sort_text_candidates_by_prominence(plausible)
@@ -333,15 +450,17 @@ def _annotate_candidate_type_priors(
     candidate = annotated.candidate
 
     if candidate.candidate_type == "brand":
+        has_txt = bool(_safe_text(candidate).strip()) or int(getattr(candidate, "text_count", 0) or 0) > 0
+        role_b = "brand_name" if has_txt else "brand"
         _assign(
             annotated,
             HeuristicDecision(
                 rule_name="candidate_type_brand",
-                assigned_role_hint="brand",
+                assigned_role_hint=role_b,
                 assigned_group_hint="brand_group",
                 assigned_importance_hint="critical",
                 confidence=0.92,
-                reason="Brand candidate from top-left compact non-text cluster.",
+                reason="Brand cluster from top strip (wordmark text or logo-only mark).",
             ),
         )
 
@@ -477,7 +596,52 @@ def _annotate_text_specific_rules(
         )
         return
 
-    if _looks_like_discount(candidate):
+    if _looks_like_compact_discount_badge(candidate):
+        _assign(
+            annotated,
+            HeuristicDecision(
+                rule_name="text_discount_badge_compact",
+                assigned_role_hint="discount_badge",
+                assigned_group_hint="badge_group",
+                assigned_importance_hint="high",
+                confidence=0.91,
+                reason="Compact percentage token behaves like a badge, not headline pricing.",
+            ),
+        )
+        return
+
+    if _looks_like_offer_promo_headline(candidate):
+        spans = _heuristic_offer_text_spans(text)
+        if spans:
+            annotated.extra_data["text_spans"] = spans
+        _assign(
+            annotated,
+            HeuristicDecision(
+                rule_name="text_offer_headline",
+                assigned_role_hint="offer_headline",
+                assigned_group_hint="headline_group",
+                assigned_importance_hint="critical",
+                confidence=0.92,
+                reason="Promotional sentence mixing value props and price tokens; node is offer headline with optional spans.",
+            ),
+        )
+        return
+
+    if _looks_like_offer_price_phrase(candidate):
+        _assign(
+            annotated,
+            HeuristicDecision(
+                rule_name="text_offer_price_phrase",
+                assigned_role_hint="offer_price_phrase",
+                assigned_group_hint="headline_group",
+                assigned_importance_hint="high",
+                confidence=0.86,
+                reason="Short phrase tying an amount to a deal (e.g. FOR $0), not a bare price line.",
+            ),
+        )
+        return
+
+    if _looks_like_discount(candidate) and not _looks_like_offer_promo_headline(candidate):
         _assign(
             annotated,
             HeuristicDecision(
@@ -490,22 +654,19 @@ def _annotate_text_specific_rules(
             ),
         )
 
-    if _looks_like_price(candidate):
-        price_role = "price_main"
-        if len(text) <= 4 and _contains_digits(candidate):
-            price_role = "price_fraction"
-
+    if _looks_like_pure_price_line(candidate):
         _assign(
             annotated,
             HeuristicDecision(
-                rule_name="text_price",
-                assigned_role_hint=price_role,
+                rule_name="text_price_pure",
+                assigned_role_hint="price",
                 assigned_group_hint="price_group",
                 assigned_importance_hint="high",
                 confidence=0.83,
-                reason="Text resembles numeric price/currency expression.",
+                reason="Text is primarily a currency amount, not a full offer sentence.",
             ),
         )
+        return
 
     if _looks_like_delivery_or_time(candidate) and not _looks_like_legal(candidate):
         _assign(
@@ -542,15 +703,17 @@ def _annotate_spatial_visual_rules(
     nodes = _candidate_nodes(candidate, nodes_map)
 
     if candidate.candidate_type == "brand" and _top_region(candidate) and _left_or_middle_region(candidate):
+        has_txt = bool(_safe_text(candidate).strip()) or int(getattr(candidate, "text_count", 0) or 0) > 0
+        role_tl = "brand_name" if has_txt else "brand_mark"
         _assign(
             annotated,
             HeuristicDecision(
                 rule_name="brand_top_left_mark",
-                assigned_role_hint="brand_mark",
+                assigned_role_hint=role_tl,
                 assigned_group_hint="brand_group",
                 assigned_importance_hint="critical",
                 confidence=0.97,
-                reason="Top-left visual/logo cluster strongly indicates brand mark.",
+                reason="Top-left cluster: wordmark text as brand_name or logo-only mark as brand_mark.",
             ),
         )
         return
@@ -698,11 +861,13 @@ def _annotate_brand_confidence_boost(
     has_shape_like = any(n.type.lower() in {"vector", "rectangle", "ellipse", "star"} for n in nodes)
 
     if has_group_like and has_shape_like:
+        has_txt = bool(_safe_text(candidate).strip()) or int(getattr(candidate, "text_count", 0) or 0) > 0
+        role_boost = "brand_name" if has_txt else "brand"
         _assign(
             annotated,
             HeuristicDecision(
                 rule_name="brand_structure_boost",
-                assigned_role_hint="brand",
+                assigned_role_hint=role_boost,
                 assigned_group_hint="brand_group",
                 assigned_importance_hint="critical",
                 confidence=0.96,
@@ -753,7 +918,7 @@ def _bucketize(bundle: HeuristicBundle) -> None:
             bundle.badge_candidates.append(cid)
         elif role == "decoration":
             bundle.decoration_candidates.append(cid)
-        elif role in {"brand", "brand_mark"}:
+        elif role in {"brand", "brand_mark", "brand_name"}:
             bundle.brand_candidates.append(cid)
         elif role in {"background", "background_shape"}:
             bundle.background_candidates.append(cid)

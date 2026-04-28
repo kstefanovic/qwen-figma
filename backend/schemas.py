@@ -27,6 +27,14 @@ class HealthResponse(BaseModel):
     backend: str
     qwen_service_ok: bool
     qwen_service_base_url: str
+    qwen_model_path: Optional[str] = Field(
+        default=None,
+        description="From Qwen service /health when reachable.",
+    )
+    qwen_vl_family: Optional[str] = Field(
+        default=None,
+        description="qwen2_5 or qwen3 from Qwen service /health when reachable.",
+    )
 
 
 class RunListItem(BaseModel):
@@ -193,6 +201,7 @@ class LayoutUpdateItem(BaseModel):
     confidence: float = 0.0
     reason: str = ""
     bounds: LayoutBounds
+    text_spans: Optional[list[dict[str, Any]]] = None
 
 
 class ConvertFrameSpec(BaseModel):
@@ -221,6 +230,7 @@ class ConvertSemanticElement(BaseModel):
     parent_semantic_name: Optional[str] = None
     confidence: float = 0.0
     reason: str = ""
+    text_spans: Optional[list[dict[str, Any]]] = None
 
 
 class ConvertSemanticGroup(BaseModel):

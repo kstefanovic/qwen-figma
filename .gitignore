@@ -1,5 +1,6 @@
 __pycache__
 .venv
 Qwen2.5-VL-7B-Instruct/*
+Qwen3-VL-8B-Instruct/*
 runs/*
 .env
