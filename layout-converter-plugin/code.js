@@ -899,12 +899,15 @@ figma.ui.onmessage = async (msg) => {
     }
     const requestUrl = backendUrl + "/api/v2/analyze-text-zone-visual-json";
     try {
+      const origin = getOrigin(selectedFrame);
+      const rawJson = serializeNode(selectedFrame, origin, "");
+      rawJson.templateId = "figma_plugin";
       postStatus("Exporting banner.png…");
       const pngBytes = await exportFramePngBytes(selectedFrame);
       const pngBase64 = uint8ToBase64(pngBytes);
-      postStatus("Calling visual zone + text-zone analysis…");
+      postStatus("Calling visual zone + text-zone analysis with raw JSON…");
       console.log("POST analyze-text-zone-visual:", requestUrl);
-      const requestBody = { banner_png_base64: pngBase64 };
+      const requestBody = { banner_png_base64: pngBase64, raw_json: rawJson };
       const response = await fetch(requestUrl, {
         method: "POST",
         headers: {
@@ -1071,7 +1074,7 @@ figma.ui.onmessage = async (msg) => {
         elementAtlasRegions.length,
       );
       postStatus(
-        `Sending ~${approxMb} MB (banner.png + elements.png + raw JSON, ${elementAtlasRegions.length} boxes)…`,
+        `Sending ~${approxMb} MB (banner.png + elements.png + raw JSON, ${elementAtlasRegions.length} boxes). Backend will flatten raw JSON to mid.json…`,
       );
 
       response = await fetch(requestUrl, {
@@ -1093,6 +1096,9 @@ figma.ui.onmessage = async (msg) => {
 
     const result = await response.json();
     console.log("Backend result:", result);
+    if (result.debug && result.debug.mid_json_path) {
+      console.log("Backend mid.json:", result.debug.mid_json_path);
+    }
 
     if (!result || typeof result !== "object") {
       throw new Error("Backend response is invalid.");
@@ -1124,6 +1130,9 @@ figma.ui.onmessage = async (msg) => {
     console.log("Semantic elements applied:", semanticSummary.semanticElementsApplied);
     console.log("Semantic groups received:", semanticSummary.semanticGroupsReceived);
     console.log("Semantic groups applied:", semanticSummary.semanticGroupsApplied);
+    if (result.debug && result.debug.mid_json_path) {
+      console.log("Mid JSON used by backend:", result.debug.mid_json_path);
+    }
     console.log("Renamed visible containers:", semanticSummary.renamedVisibleContainers);
     console.log("Groups created:", semanticSummary.groupsCreated);
     console.log("Groups skipped:", semanticSummary.groupsSkipped);

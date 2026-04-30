@@ -12,7 +12,16 @@ ZONE_TYPES: frozenset[str] = frozenset(
 ORIENTATIONS: frozenset[str] = frozenset({"landscape", "wide", "portrait"})
 
 TEXT_ZONE_GROUP_ROLES: frozenset[str] = frozenset(
-    {"brand_group", "headline_group", "age_badge_group", "legal_text_group"},
+    {
+        "brand_group",
+        "headline_group",
+        "legal_text_group",
+        "age_badge_group",
+        "hero_image_group",
+        "star_group",
+        "glow_group",
+        "bg_shape_group",
+    },
 )
 
 # Top-level group JSON may use legacy names; normalize before validation.
@@ -47,6 +56,10 @@ TEXT_ZONE_HEADLINE_CHILD_ROLES: frozenset[str] = frozenset(
 TEXT_ZONE_LEGAL_CHILD_ROLES: frozenset[str] = frozenset({"legal_text"})
 
 TEXT_ZONE_AGE_BADGE_CHILD_ROLES: frozenset[str] = frozenset({"age_badge"})
+TEXT_ZONE_HERO_IMAGE_CHILD_ROLES: frozenset[str] = frozenset({"hero_image", "here_image"})
+TEXT_ZONE_STAR_CHILD_ROLES: frozenset[str] = frozenset({"star_1", "star_2"})
+TEXT_ZONE_GLOW_CHILD_ROLES: frozenset[str] = frozenset({"glow_1", "glow_2"})
+TEXT_ZONE_BG_SHAPE_CHILD_ROLES: frozenset[str] = frozenset({"bg_shape"})
 
 TEXT_ZONE_LOGO_CHILD_ROLES: frozenset[str] = frozenset({"logo", "logo_back", "logo_fore"})
 
@@ -55,8 +68,15 @@ TEXT_ZONE_CHILD_TEXT_MAX_CHARS: int = 8000
 
 
 def text_zone_child_may_omit_transcribed_text(parent_role: str, child_role: str) -> bool:
-    """Only logo marks omit transcribed text. If a nested legal_text child exists, it must carry full OCR."""
-    return (child_role or "").strip() in TEXT_ZONE_LOGO_CHILD_ROLES
+    """Visual/non-text roles omit transcribed text. Legal/text roles must carry OCR."""
+    role = (child_role or "").strip()
+    return role in (
+        TEXT_ZONE_LOGO_CHILD_ROLES
+        | TEXT_ZONE_HERO_IMAGE_CHILD_ROLES
+        | TEXT_ZONE_STAR_CHILD_ROLES
+        | TEXT_ZONE_GLOW_CHILD_ROLES
+        | TEXT_ZONE_BG_SHAPE_CHILD_ROLES
+    )
 
 TEXT_ZONE_CHILD_ROLE_ALIASES: dict[str, str] = {
     "subheadlne_product_name": "product_name",
@@ -80,6 +100,14 @@ def is_allowed_text_zone_child_for_parent(parent_role: str, child_role_raw: str)
         return c in TEXT_ZONE_LEGAL_CHILD_ROLES
     if parent_role == "age_badge_group":
         return c in TEXT_ZONE_AGE_BADGE_CHILD_ROLES
+    if parent_role == "hero_image_group":
+        return c in TEXT_ZONE_HERO_IMAGE_CHILD_ROLES
+    if parent_role == "star_group":
+        return c in TEXT_ZONE_STAR_CHILD_ROLES
+    if parent_role == "glow_group":
+        return c in TEXT_ZONE_GLOW_CHILD_ROLES
+    if parent_role == "bg_shape_group":
+        return c in TEXT_ZONE_BG_SHAPE_CHILD_ROLES
     return False
 
 
@@ -106,6 +134,14 @@ def text_zone_child_sort_key(parent_role: str, child_role: str) -> int:
         order = ("legal_text",)
     elif parent_role == "age_badge_group":
         order = ("age_badge",)
+    elif parent_role == "hero_image_group":
+        order = ("hero_image", "here_image")
+    elif parent_role == "star_group":
+        order = ("star_1", "star_2")
+    elif parent_role == "glow_group":
+        order = ("glow_1", "glow_2")
+    elif parent_role == "bg_shape_group":
+        order = ("bg_shape",)
     else:
         order = ()
     try:

@@ -257,7 +257,16 @@ The orientation value in your JSON must match the image pixel dimensions using t
 
 
 _TEXT_ZONE_VISUAL_ROLES = frozenset(
-    {"brand_group", "headline_group", "age_badge_group", "legal_text_group"},
+    {
+        "brand_group",
+        "headline_group",
+        "legal_text_group",
+        "age_badge_group",
+        "hero_image_group",
+        "star_group",
+        "glow_group",
+        "bg_shape_group",
+    },
 )
 _TEXT_ZONE_LEGACY_LOGO_ROLE = "logo_group"
 _TEXT_ZONE_GROUP_LEGACY_ALIASES: dict[str, str] = {
@@ -282,13 +291,14 @@ You receive one rendered banner image.
 
 **CRITICAL (downstream contract):**
 1) Put the **actual string** read from the image in the JSON **`"text"`** field for **every** child except `logo` / `logo_back` / `logo_fore`. For those three roles **`"text"` must always be `""`** (marks/shapes only — **never** put readable words like **Яндекс** or **Лавка** there). **Do not** leave `"text": ""` on **`brand_name` / `brand_name_first` / `brand_name_second`** when the word is visible. Do **not** hide copy only inside `"reason"`.
-2) **`brand_group` row «Яндекс [heart] Лавка»** (or any **two words + symbol between**): output **exactly** `brand_name_first` (left word, non-empty `text`) + **`logo`** (the **whole** icon cell between words, **`"text": ""`**) + `brand_name_second` (right word, non-empty `text`). **Forbidden:** using **`logo_fore`** or **`logo_back`** for either **word** — `logo_fore` is only the **foreground graphic** (e.g. heart) on a badge when you **split** plate vs mark; it is **not** the word **Лавка**. Do not label the left word as `logo`.
+2) **`brand_group` row «Яндекс [heart on ellipse/circle] Лавка»** (or any **two words + symbol between**): output **exactly** `brand_name_first` (left word, non-empty `text`) + **`logo_back`** (the ellipse/circle/plate behind the mark, **`"text": ""`**) + **`logo_fore`** (the foreground heart/mark, **`"text": ""`**) + `brand_name_second` (right word, non-empty `text`). **`logo_fore` bbox must be inside `logo_back` bbox.** Use a single **`logo`** child only when the mark has **no visible separate backing/plate**. **Forbidden:** using **`logo_fore`** or **`logo_back`** for either **word** — `logo_fore` is only the **foreground graphic** (e.g. heart); it is **not** the word **Лавка**. Do not label the left word as `logo`.
 3) **Assign each readable marketing line to exactly one role once** — no duplicate strings across `brand_group` and `headline_group`. The **service / app name** (e.g. **Яндекс + logo + Лавка**, "DoorDash", "Uber Eats") belongs **only** in **`brand_group`** children. **Never** put that brand line as **`headline`**. **`headline`** is the main **offer / CTA / campaign promise** (e.g. «Доставим лекарства из аптек», "Groceries delivered"). **Visual rule:** the **brand row may use a larger point size than the offer line** — still treat the **identity row** as `brand_group` and the **offer line** as `headline`; **do not** pick `headline` by largest font alone.
 4) **`headline_group` stacking:** **`headline`** = the dominant **offer** block (often the heaviest weight among *promotional* lines). The **closest** line **directly under** that headline (same column, next line down) is **`subheadline_delivery_time`** when it is a **time / speed** fragment (e.g. «от 15 минут», "in 15 min") or **`subheadline`** otherwise. **Split** them: e.g. headline `"Доставим лекарства из аптек"` and **separate** child `subheadline_delivery_time` `"от 15 минут"` — **do not** merge both into one `headline` or one `subheadline_delivery_time` when the image shows **two** lines. **Concrete RU examples:** (a) headline `"Новогодние продукты от Яндекс Лавки"` **plus** `subheadline_delivery_time` `"с доставкой от 15 минут"` under it — **two** children, **two** bboxes. (b) Pharmacy / Lavka-style: headline `"Доставим лекарства из аптек"` **plus** **separate** line `"от 15 минут"` (or «от 15 минут») as **`subheadline_delivery_time`** — **not** merged into `headline` **text**. **Never** fold a **separate** visual delivery-speed line into `headline`.
 5) **`legal_text_group`:** if you include **any** nested child with role **`legal_text`**, its **`"text"` must be the full OCR** of **every** visible line in that disclaimer block (seller, address, ОГРН, tax lines, «…», etc.). Use newline `\\n` between lines as printed. **Never** `"text": ""` for that child when glyphs exist. Prefer **`"children": []`** only when you are sure there is no structured child needed — otherwise one child with full `text`. *(A **standalone** corner age-rating badge like **«0+»** is **not** this group — use **`age_badge_group`**, rule 8.)*
 6) **`headline_group` / `subheadline_delivery_time` (legal vs marketing):** use `subheadline_delivery_time` **only** for a **short** marketing line tied to the hero offer (e.g. «привезёт курьер от 15 минут», «с доставкой от 15 мин», "Delivery in 15 min"). **Do not** put dense multi-line **regulatory / seller / partner / ОГРН** copy here — that entire block belongs under the top-level **`legal_text_group`** (see rule 5).
 7) When rule 4 applies (a visible second line under the main headline), you **must** output **`subheadline_delivery_time`** (or `subheadline`) with non-empty **`text`** unless that line is **legal** micro-copy (then it belongs in **`legal_text_group`** as a **`legal_text`** child, rules 5–6). Omitting a required marketing subline is an error.
 8) **`age_badge_group` (only when a real mark exists):** Many ads place a **tiny age-rating mark** (**0+**, **6+**, **12+**, **16+**, **18+**) on a **small plate** or as **plain text**, often **white/light on the photo**. **Include `age_badge_group` only when you clearly see** that **small standalone N+** mark — **not** the brand row, not the logo, not a guess. **Anti-hallucination:** **Never** treat the **brand logo** (heart/icon **between** words), **decorative circles**, or **price / volume** digits as **0+**. The real mark is usually **much smaller** than the **brand toolbar** and **not** the same bbox as **Яндекс / Лавка**. **If uncertain, omit `age_badge_group` entirely** — **do not invent** **0+**. **Critical placement:** when present, the mark is often **inside the hero / product photo** (e.g. **top-right** of the **full** frame in **portrait** `upper_image_lower_text`), **not** merged into **`brand_group`**. **Before returning JSON**, **scan all four corners** and the **upper photo band** (top ~55%) for **«0+»**-style glyphs. **Do not** put that standalone badge inside **`legal_text_group`** or **`headline_group`**. **Omit** the whole **`age_badge_group`** when **no** such mark exists.
+9) **BBox precision is critical:** every bbox must be the smallest axis-aligned rectangle that covers the **visible pixels of that exact semantic element** in the full banner image. Use **top-left `x`,`y` plus `width`,`height`**, normalized **0..1** by full image width/height. **Do not** output center points, x2/y2 corners, candidate IDs, or approximate layout regions. **Do not** include padding, empty background, the whole text column, the photo area, or neighboring lines. For text children, wrap the actual glyph ink (including accents/descenders) with only a tiny safety margin if needed. For `logo` / `logo_back` / `logo_fore`, wrap only the visible mark/plate for that child. Top-level group bboxes must tightly wrap the **union of their visible children**; they should not extend to the full row/column/band unless the visible children truly occupy it. If a line is split into separate children, each child gets its **own** tight bbox.
 
 First classify:
 1. orientation
@@ -299,13 +309,18 @@ Then detect top-level text groups (all that apply):
 - headline_group
 - age_badge_group (**only when a clear N+ mark exists** — see rule 8; often **on the hero photo**, e.g. top-right)
 - legal_text_group
+- hero_image_group (**visual group** — detect the main product/photo/illustration hero; use one `hero_image` child when present)
+- star_group (**structural placeholder only for now — use `"children": []` unless a later detector fills it**)
+- glow_group (**structural placeholder only for now — use `"children": []` unless a later detector fills it**)
+- bg_shape_group (**structural placeholder only for now — use `"children": []` unless a later detector fills it**)
 
 Then detect inner children.
 
 For brand_group children (omit if not visible):
 - **brand_name_first** / **brand_name_second**: the **left** and **right** readable words when the brand is **two words with a mark between** (e.g. Яндекс … Лавка). **`text`** = the exact word string.
-- **logo**: bbox around the **symbol/icon cell between the two words** (circle + heart as **one** unit is usually one `logo`). **`"text"` is always `""`**.
-- **logo_back** + **logo_fore**: optional **split** of one physical badge — `logo_back` = plate/circle; `logo_fore` = **small graphic** on the plate (heart, arrow), **not** a second word. Both must use empty `"text"`. Prefer a single **`logo`** child unless the image clearly separates plate vs mark.
+- **logo_back**: bbox around the **background plate** of the logo cell (usually white ellipse/circle/disc). **`"text"` is always `""`**.
+- **logo_fore**: bbox around the **foreground graphic** on that plate (usually the blue/colored heart). **`"text"` is always `""`**. Its bbox must sit **inside** `logo_back`.
+- **logo**: use only when the brand mark has **no separable plate/backing**; bbox around the whole visible mark/cell. **`"text"` is always `""`**. For the common **circle/ellipse + heart** Yandex/Lavka-style mark, **do not use `logo`; use `logo_back` + `logo_fore` instead**.
 - **brand_name**: one **single** contiguous brand word or fused logotype (e.g. "DOORDASH") when there is no two-word+mark layout.
 Include readable brand text in **`brand_name*`** only; never in `logo*`.
 
@@ -326,11 +341,21 @@ For **age_badge_group** (top-level):
 - **One** child with role **`age_badge`**: **`"text"`** = exact OCR (e.g. `"0+"`). Bbox **tight** on the mark, coordinates relative to **full** banner (including photo area).
 - **`"children": []`** only when you **omit the entire `age_badge_group`** because **no** rating mark exists.
 
-Allowed top-level group roles: **brand_group**, **headline_group**, **age_badge_group**, **legal_text_group** (exact strings).
+For **hero_image_group** (top-level):
+- Detect the **dominant non-text visual / product / photo / illustration** area of the banner: bottle, package, food, person, scene, or main decorative product composition.
+- Emit exactly **one** child with role **`hero_image`** when a hero visual exists. **`"text"` must be `""`**.
+- The `hero_image` bbox must tightly wrap the visible hero visual only. **Do not include** brand text, headline text, legal text, age badge, or blank background.
+- If there is no dominant hero visual (mostly text-only banner), keep **`children: []`**.
+
+Allowed top-level group roles: **brand_group**, **headline_group**, **legal_text_group**, **age_badge_group**, **hero_image_group**, **star_group**, **glow_group**, **bg_shape_group** (exact strings).
 Allowed brand child roles: logo, logo_back, logo_fore, brand_name, brand_name_first, brand_name_second.
 Allowed headline child roles: headline, subheadline, subheadline_delivery_time, subheadline_weight, product_name, subheadline_discount.
 Allowed **legal_text_group** child role: **legal_text** only.
 Allowed **age_badge_group** child role: **age_badge** only.
+Allowed **hero_image_group** child role: **hero_image** only.
+Allowed **star_group** child roles: **star_1**, **star_2** only (but return empty children for now).
+Allowed **glow_group** child roles: **glow_1**, **glow_2** only (but return empty children for now).
+Allowed **bg_shape_group** child role: **bg_shape** only (but return empty children for now).
 Use role "product_name" exactly (not subheadline_product_name).
 
 **legal_text_group** is **tiny dense** regulatory / fee / tax / seller / partner / eligibility disclaimer (often ALL CAPS or small caps, smallest font). It is **not** the main headline stack. **Short** emotional delivery hooks ("Hungry? Delivery is on Us.", «курьер от 15 мин») stay in **headline_group** as `subheadline_delivery_time`. **Partner/seller/address/ОГРН** stacks are **always** a **`legal_text`** child under **`legal_text_group`**. The group bbox must cover **all** such micro-lines together (e.g. "$0 DELIVERY FEE…" through "…STILL APPLY." or full RU seller block).
@@ -417,20 +442,23 @@ Rules:
 - Output one fully closed JSON object (balanced braces/brackets). Do not stop mid-JSON.
 - Do not output logo_group (use brand_group).
 - Do not invent roles outside the allowed lists.
-- Do not analyze product/person/hero image/background/decorations **for decorative layout** — **except** you **must** still read **standalone age-rating marks** (**0+**, **6+**, …) on the photo or in corners and output **`age_badge_group`** with an **`age_badge`** child (rule 8).
-- Each bbox: object with "x","y","width","height" (0..1 relative to full banner). No bare numbers after "x": without keys.
-- **"text" field (OCR / transcription):** `logo` / `logo_back` / `logo_fore` → **`"text"` always `""`**. For **every other** child you **must** set `"text"` to the **exact readable string** from the image (Unicode as printed). That includes **`legal_text` child under `legal_text_group`** (full disclaimer), **`age_badge` child under `age_badge_group`** (e.g. `"0+"`), plus `brand_name*`, `headline`, all `subheadline*` roles, and `product_name`. **Never use `"text": ""`** on those when the glyphs are visible. **Bad examples:** `"headline": { ..., "text": "" }` while readable; **`legal_text` child with empty `text`** while the footer is visible; **`logo` with `"text": "Яндекс"`** — wrong role, use `brand_name_first`.
+- Do not analyze product/person/hero image/background/decorations **for text roles** — **except** you **must** output the dominant non-text hero visual as **`hero_image_group` → `hero_image`** and still read **standalone age-rating marks** (**0+**, **6+**, …) on the photo or in corners as **`age_badge_group`** with an **`age_badge`** child (rule 8).
+- Each bbox: object with "x","y","width","height" (0..1 relative to full banner). No bare numbers after "x": without keys. **`x`,`y` are the top-left corner, not the center. `width`,`height` are size, not right/bottom.**
+- **Tight bbox rule:** before writing each bbox, visually trace the leftmost, topmost, rightmost, and bottommost visible pixels for that exact element, then convert those four edges to normalized `x`, `y`, `width`, `height`. Prefer a bbox that is slightly too tight over one that captures unrelated neighboring text, whitespace, background, photo, or full layout columns.
+- **Group bbox rule:** a top-level group bbox must be the tight outer rectangle around its children (brand row, headline stack, legal block, or age badge), not a broad zone. A child bbox must never cover multiple semantic children unless those lines intentionally form one child (for example a same-weight multi-line `headline`).
+- **"text" field (OCR / transcription):** `logo` / `logo_back` / `logo_fore` / `hero_image` / `star_1` / `star_2` / `glow_1` / `glow_2` → **`"text"` always `""`**. For **every other** child you **must** set `"text"` to the **exact readable string** from the image (Unicode as printed). That includes **`legal_text` child under `legal_text_group`** (full disclaimer), **`age_badge` child under `age_badge_group`** (e.g. `"0+"`), plus `brand_name*`, `headline`, all `subheadline*` roles, and `product_name`. **Never use `"text": ""`** on those when the glyphs are visible. **Bad examples:** `"headline": { ..., "text": "" }` while readable; **`legal_text` child with empty `text`** while the footer is visible; **`logo` with `"text": "Яндекс"`** — wrong role, use `brand_name_first`.
 - Omit absent **children** inside groups when not visible. For top-level groups: **always include brand_group, headline_group, and `legal_text_group`** whenever those regions exist; **footer disclaimer is almost never absent** on real commercial banners. **`age_badge_group`**: **omit the whole group** when **no** clear **N+** mark exists (rule 8 — **never** guess from the brand/logo row).
 - Keep each "reason" string short (about one line). For **`legal_text_group`**: use **`children: []`** or **one `legal_text` child** with **full** disclaimer text — do not add a placeholder child with empty `text`.
 
 **Final checklist before you output JSON:**
 0) **zone_type:** image-on-top + single text stack below (portrait DM) → **`upper_image_lower_text`** unless a real **text band sits above** the photo (then `upper_text_mid_image_lower_text`).
-1) Two-word brand with mark between (Яндекс … Лавка): **`brand_name_first`** + **`logo`** (`text` **empty**) + **`brand_name_second`**; words **only** in `brand_name_*`, never on `logo` / `logo_fore` / `logo_back`. Single-word brand: one `brand_name` or `logo`+`brand_name` as appropriate. **Do not** repeat those words as `headline`.
+1) Two-word brand with mark between (Яндекс … Лавка): **`brand_name_first`** + **`logo_back`** (ellipse/circle plate, `text` **empty**) + **`logo_fore`** (heart/foreground mark, `text` **empty**) + **`brand_name_second`**. The **`logo_fore` bbox must be inside `logo_back`**. Words **only** in `brand_name_*`, never on `logo` / `logo_fore` / `logo_back`. Single-word brand: one `brand_name` or `logo`+`brand_name` as appropriate. **Do not** repeat those words as `headline`.
 1b) `brand_name` / `brand_name_*`: `"text"` = exact string (e.g. DOORDASH, Яндекс, Лавка).
 2) `headline`: **offer only** — `"text"` = main promise (e.g. «Доставим лекарства из аптек»); multi-line **same-weight** offer = one `headline` with one bbox (e.g. GET 10 + DELIVERIES + FOR $0).
 3) **Mandatory** when visible: the **next line down** under that offer (e.g. «от 15 минут») → **`subheadline_delivery_time`** with its **own** bbox and non-empty `"text"` (CRITICAL headline stacking, rule 4).
 4) Footer / seller / partner / ОГРН block: top-level **`legal_text_group`** bbox wraps **all** micro-lines; nested **`legal_text`** child's `"text"` = **full** OCR (newlines as printed). **Never** empty `text` for that child when the block exists.
 5) **Age badge:** only if a **small real** **0+** / **6+** / … mark is visible (often **top-right on the photo**), **`age_badge_group`** + **`age_badge`** with **tight** bbox — **not** on the brand/logo strip. If none, **omit** the group (rule 8).
+6) **BBox sanity:** every child bbox should touch only that child’s visible glyphs/mark; every group bbox should be the tight union of its children. If a bbox includes large blank background or another element, recompute it tighter before returning JSON.
 
 The orientation value must match image pixel dimensions using the orientation rules above.
 """.strip()
@@ -576,7 +604,16 @@ def _dedupe_text_zone_groups_by_role(
             warnings.append(
                 f"Duplicate role={role!r}: dropped lower confidence ({cf:.4f} vs kept {pcf:.4f})",
             )
-    order = ("brand_group", "headline_group", "age_badge_group", "legal_text_group")
+    order = (
+        "brand_group",
+        "headline_group",
+        "legal_text_group",
+        "age_badge_group",
+        "hero_image_group",
+        "star_group",
+        "glow_group",
+        "bg_shape_group",
+    )
     return [by_role[r] for r in order if r in by_role]
 
 
@@ -602,6 +639,10 @@ _TEXT_ZONE_HEADLINE_CHILD_ROLES = frozenset(
 )
 _TEXT_ZONE_LEGAL_CHILD_ROLES = frozenset({"legal_text"})
 _TEXT_ZONE_AGE_BADGE_CHILD_ROLES = frozenset({"age_badge"})
+_TEXT_ZONE_HERO_IMAGE_CHILD_ROLES = frozenset({"hero_image", "here_image"})
+_TEXT_ZONE_STAR_CHILD_ROLES = frozenset({"star_1", "star_2"})
+_TEXT_ZONE_GLOW_CHILD_ROLES = frozenset({"glow_1", "glow_2"})
+_TEXT_ZONE_BG_SHAPE_CHILD_ROLES = frozenset({"bg_shape"})
 _TEXT_ZONE_LOGO_CHILD_ROLES = frozenset({"logo", "logo_back", "logo_fore"})
 _TEXT_ZONE_CHILD_TEXT_MAX_CHARS = 8000
 _TEXT_ZONE_CHILD_ROLE_ALIASES = {
@@ -625,6 +666,14 @@ def _allowed_child_roles_for_parent(parent_role: str) -> frozenset[str]:
         return _TEXT_ZONE_LEGAL_CHILD_ROLES
     if parent_role == "age_badge_group":
         return _TEXT_ZONE_AGE_BADGE_CHILD_ROLES
+    if parent_role == "hero_image_group":
+        return _TEXT_ZONE_HERO_IMAGE_CHILD_ROLES
+    if parent_role == "star_group":
+        return _TEXT_ZONE_STAR_CHILD_ROLES
+    if parent_role == "glow_group":
+        return _TEXT_ZONE_GLOW_CHILD_ROLES
+    if parent_role == "bg_shape_group":
+        return _TEXT_ZONE_BG_SHAPE_CHILD_ROLES
     return frozenset()
 
 
@@ -651,6 +700,14 @@ def _child_role_sort_index(parent_role: str, child_role: str) -> int:
         order = ("legal_text",)
     elif parent_role == "age_badge_group":
         order = ("age_badge",)
+    elif parent_role == "hero_image_group":
+        order = ("hero_image", "here_image")
+    elif parent_role == "star_group":
+        order = ("star_1", "star_2")
+    elif parent_role == "glow_group":
+        order = ("glow_1", "glow_2")
+    elif parent_role == "bg_shape_group":
+        order = ("bg_shape",)
     else:
         order = ()
     try:
@@ -717,7 +774,14 @@ def _infer_child_text_from_reason(reason: str) -> str:
 
 
 def _child_text_may_be_empty_for_visual(parent_role: str, child_role: str) -> bool:
-    return (child_role or "").strip() in _TEXT_ZONE_LOGO_CHILD_ROLES
+    role = (child_role or "").strip()
+    return role in (
+        _TEXT_ZONE_LOGO_CHILD_ROLES
+        | _TEXT_ZONE_HERO_IMAGE_CHILD_ROLES
+        | _TEXT_ZONE_STAR_CHILD_ROLES
+        | _TEXT_ZONE_GLOW_CHILD_ROLES
+        | _TEXT_ZONE_BG_SHAPE_CHILD_ROLES
+    )
 
 
 def _finalize_text_zone_children(
@@ -767,7 +831,7 @@ def _finalize_text_zone_children(
                     f"{parent_role} children[{j}] role={rcanon!r}: text truncated to "
                     f"{_TEXT_ZONE_CHILD_TEXT_MAX_CHARS} chars",
                 )
-        if not tstr and rcanon not in _TEXT_ZONE_LOGO_CHILD_ROLES:
+        if not tstr and not _child_text_may_be_empty_for_visual(parent_role, rcanon):
             inferred = _infer_child_text_from_reason(cr)
             if inferred:
                 tstr = inferred
@@ -775,11 +839,10 @@ def _finalize_text_zone_children(
                     f"{parent_role} children[{j}] role={rcanon!r}: filled \"text\" from quoted snippet in "
                     f"\"reason\" (model should still emit text directly in JSON).",
                 )
-        if rcanon in _TEXT_ZONE_LOGO_CHILD_ROLES and tstr:
+        if _child_text_may_be_empty_for_visual(parent_role, rcanon) and tstr:
             warnings.append(
                 f"{parent_role} children[{j}] role={rcanon!r}: cleared non-empty \"text\" ({tstr[:80]!r}…) — "
-                f"logo/logo_back/logo_fore must use empty \"text\"; put words in brand_name / brand_name_first / "
-                f"brand_name_second.",
+                f"visual roles must use empty \"text\".",
             )
             tstr = ""
         if not _child_text_may_be_empty_for_visual(parent_role, rcanon) and not tstr:
@@ -1037,6 +1100,7 @@ Return **JSON only** (no markdown, no fences), one object:
 Rules:
 - Set **present** to **true** only if you **clearly** see that age mark alone.
 - If **present** is **true**, **text** must be the exact characters (e.g. **"0+"**), and **bbox** must **tightly** wrap **only** that mark, with **x, y, width, height** normalized to **0..1** relative to the **full image** (width and height).
+- Bbox precision: `x`,`y` are the **top-left** corner and `width`,`height` are the visible mark size. Do **not** include the brand row, nearby logo, photo region, padding, or empty background; trace only the age-mark glyphs/plate.
 - If **present** is **false**, leave **text** empty and bbox may be zeros.
 - **confidence** in 0..1 for your **present** decision.
 
@@ -1134,7 +1198,8 @@ Return **JSON only** (no markdown, no fences), one object:
 Rules:
 - **present** = **true** only if you **clearly** read such a micro-copy block.
 - If **present** is **true**, **text** must be the **full OCR** of **every** line in that block (join lines with `\\n` as printed). **Do not** truncate mid-sentence.
-- **bbox** must wrap **all** of that micro-copy, **x,y,width,height** normalized **0..1** to the **full image**.
+- **bbox** must tightly wrap **all and only** that micro-copy, **x,y,width,height** normalized **0..1** to the **full image**.
+- Bbox precision: `x`,`y` are the **top-left** corner and `width`,`height` are size, not right/bottom. Do **not** include the main headline, brand row, large footer band, blank margins, or surrounding background; use the smallest rectangle around the visible legal glyphs.
 - If **present** is **false**, **text** empty and bbox may be zeros.
 - **confidence** in 0..1.
 
@@ -1266,6 +1331,7 @@ Rules:
 - **present** = **true** only if that **separate thinner second line** exists **under** the hero offer.
 - If **present** is **true**, **text** = exact OCR of **only** that line (one line, no newlines).
 - **bbox** must **tightly** wrap **only** that line; **x,y,width,height** normalized **0..1** on the **full** image.
+- Bbox precision: `x`,`y` are the **top-left** corner and `width`,`height` are size. Do **not** include the main headline above, legal footer below, the whole text column, blank line spacing, or background.
 - If **present** is **false**, leave **text** empty; bbox may be zeros.
 - **confidence** in 0..1 for the **present** decision.
 

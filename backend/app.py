@@ -24,7 +24,15 @@ from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from backend.api_run_artifacts import (
+    persist_api_error,
+    persist_convert_call,
+    persist_multipart_pipeline_run,
+    persist_v2_call,
+    repo_runs_dir,
+)
 from backend.convert_scene import build_convert_semantic_payload
+from backend.mid_json import build_mid_json
 from backend.pipeline_v2.analyze_text_zone_visual import analyze_text_zone_visual_from_banner_bytes
 from backend.pipeline_v2.qwen_zone_classifier import classify_zone_from_banner_bytes
 from backend.pipeline_v2.schemas import (
@@ -53,7 +61,7 @@ from backend.schemas import (
 from backend.storage import RunStorage
 
 
-RUNS_DIR = Path("runs")
+RUNS_DIR = repo_runs_dir()
 QWEN_BASE_URL = default_qwen_base_url()
 
 
@@ -310,9 +318,33 @@ def _qwen_error_response_detail(body: Any) -> Any:
     return body
 
 
-def _analyze_text_zone_visual_from_raw_bytes(raw: bytes) -> AnalyzeTextZoneVisualResponse:
+def _save_mid_json_for_run(run_id: str, raw_json: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    mid_json = build_mid_json(raw_json)
+    mid_json_path = storage.save_upload_bytes(
+        run_id,
+        "mid.json",
+        json.dumps(mid_json, ensure_ascii=False).encode("utf-8"),
+    )
+    return mid_json_path, mid_json
+
+
+def _load_raw_json_bytes(raw_json_bytes: bytes) -> dict[str, Any]:
     try:
-        return analyze_text_zone_visual_from_banner_bytes(raw, qwen_base_url=QWEN_BASE_URL)
+        payload = json.loads(raw_json_bytes.decode("utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"raw_json is not valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="raw_json must contain one root object.")
+    return payload
+
+
+def _analyze_text_zone_visual_from_raw_bytes(raw: bytes, *, run_id: str | None = None) -> AnalyzeTextZoneVisualResponse:
+    try:
+        return analyze_text_zone_visual_from_banner_bytes(
+            raw,
+            qwen_base_url=QWEN_BASE_URL,
+            run_id=run_id,
+        )
     except QwenServiceHTTPError as exc:
         if exc.status_code == 422:
             raise HTTPException(
@@ -331,10 +363,10 @@ def _analyze_text_zone_visual_from_raw_bytes(raw: bytes) -> AnalyzeTextZoneVisua
         ) from exc
 
 
-def _classify_zone_v2_from_raw_bytes(raw: bytes) -> ClassifyZoneResponse | JSONResponse:
+def _classify_zone_v2_from_raw_bytes(raw: bytes, *, run_id: str | None = None) -> ClassifyZoneResponse | JSONResponse:
     """Shared handler for multipart and JSON plugin entrypoints."""
     try:
-        return classify_zone_from_banner_bytes(raw, qwen_base_url=QWEN_BASE_URL)
+        return classify_zone_from_banner_bytes(raw, qwen_base_url=QWEN_BASE_URL, run_id=run_id)
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     except HTTPException:
@@ -378,7 +410,47 @@ async def classify_zone_v2(banner_png: UploadFile = File(..., description="Banne
     raw = await banner_png.read()
     if not raw:
         raise HTTPException(status_code=400, detail="banner_png is empty.")
-    return _classify_zone_v2_from_raw_bytes(raw)
+    run_id = storage.create_run()
+    banner_path = storage.save_upload_bytes(run_id, "banner.png", raw)
+    storage.update_meta(
+        run_id,
+        status="running",
+        input_files={"banner_image": banner_path},
+        metadata={"source": "http_api", "endpoint": "/api/v2/classify-zone"},
+    )
+    try:
+        result = _classify_zone_v2_from_raw_bytes(raw, run_id=run_id)
+        persist_v2_call(
+            storage,
+            run_id,
+            endpoint="/api/v2/classify-zone",
+            raw_banner_bytes=raw,
+            response=result,
+        )
+        storage.update_meta(run_id, status="completed")
+        return result
+    except HTTPException as exc:
+        persist_api_error(
+            storage,
+            run_id,
+            endpoint="/api/v2/classify-zone",
+            error_type="HTTPException",
+            detail=exc.detail,
+            raw_banner_bytes=raw,
+        )
+        storage.update_meta(run_id, status="failed", error=str(exc.detail)[:4000])
+        raise
+    except Exception as exc:
+        persist_api_error(
+            storage,
+            run_id,
+            endpoint="/api/v2/classify-zone",
+            error_type=type(exc).__name__,
+            detail=str(exc),
+            raw_banner_bytes=raw,
+        )
+        storage.update_meta(run_id, status="failed", error=str(exc)[:4000])
+        raise
 
 
 @app.post(
@@ -400,7 +472,47 @@ async def classify_zone_v2_plugin_json(body: ClassifyZonePluginRequest = Body(..
         raw = _decode_png_base64(body.banner_png_base64)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return _classify_zone_v2_from_raw_bytes(raw)
+    run_id = storage.create_run()
+    banner_path = storage.save_upload_bytes(run_id, "banner.png", raw)
+    storage.update_meta(
+        run_id,
+        status="running",
+        input_files={"banner_image": banner_path},
+        metadata={"source": "http_api", "endpoint": "/api/v2/classify-zone-json"},
+    )
+    try:
+        result = _classify_zone_v2_from_raw_bytes(raw, run_id=run_id)
+        persist_v2_call(
+            storage,
+            run_id,
+            endpoint="/api/v2/classify-zone-json",
+            raw_banner_bytes=raw,
+            response=result,
+        )
+        storage.update_meta(run_id, status="completed")
+        return result
+    except HTTPException as exc:
+        persist_api_error(
+            storage,
+            run_id,
+            endpoint="/api/v2/classify-zone-json",
+            error_type="HTTPException",
+            detail=exc.detail,
+            raw_banner_bytes=raw,
+        )
+        storage.update_meta(run_id, status="failed", error=str(exc.detail)[:4000])
+        raise
+    except Exception as exc:
+        persist_api_error(
+            storage,
+            run_id,
+            endpoint="/api/v2/classify-zone-json",
+            error_type=type(exc).__name__,
+            detail=str(exc),
+            raw_banner_bytes=raw,
+        )
+        storage.update_meta(run_id, status="failed", error=str(exc)[:4000])
+        raise
 
 
 @app.post(
@@ -423,7 +535,47 @@ async def analyze_text_zone_visual_v2(
     raw = await banner_png.read()
     if not raw:
         raise HTTPException(status_code=400, detail="banner_png is empty.")
-    return _analyze_text_zone_visual_from_raw_bytes(raw)
+    run_id = storage.create_run()
+    banner_path = storage.save_upload_bytes(run_id, "banner.png", raw)
+    storage.update_meta(
+        run_id,
+        status="running",
+        input_files={"banner_image": banner_path},
+        metadata={"source": "http_api", "endpoint": "/api/v2/analyze-text-zone-visual"},
+    )
+    try:
+        result = _analyze_text_zone_visual_from_raw_bytes(raw, run_id=run_id)
+        persist_v2_call(
+            storage,
+            run_id,
+            endpoint="/api/v2/analyze-text-zone-visual",
+            raw_banner_bytes=raw,
+            response=result,
+        )
+        storage.update_meta(run_id, status="completed")
+        return result
+    except HTTPException as exc:
+        persist_api_error(
+            storage,
+            run_id,
+            endpoint="/api/v2/analyze-text-zone-visual",
+            error_type="HTTPException",
+            detail=exc.detail,
+            raw_banner_bytes=raw,
+        )
+        storage.update_meta(run_id, status="failed", error=str(exc.detail)[:4000])
+        raise
+    except Exception as exc:
+        persist_api_error(
+            storage,
+            run_id,
+            endpoint="/api/v2/analyze-text-zone-visual",
+            error_type=type(exc).__name__,
+            detail=str(exc),
+            raw_banner_bytes=raw,
+        )
+        storage.update_meta(run_id, status="failed", error=str(exc)[:4000])
+        raise
 
 
 @app.post(
@@ -442,7 +594,68 @@ async def analyze_text_zone_visual_v2_json(
         raw = _decode_png_base64(body.banner_png_base64)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return _analyze_text_zone_visual_from_raw_bytes(raw)
+    run_id = storage.create_run()
+    banner_path = storage.save_upload_bytes(run_id, "banner.png", raw)
+    input_files: dict[str, Any] = {"banner_image": banner_path}
+    metadata: dict[str, Any] = {
+        "source": "http_api",
+        "endpoint": "/api/v2/analyze-text-zone-visual-json",
+    }
+    if body.raw_json is not None:
+        raw_json_path = storage.save_upload_bytes(
+            run_id,
+            "raw.json",
+            json.dumps(body.raw_json, ensure_ascii=False).encode("utf-8"),
+        )
+        try:
+            mid_json_path, mid_json = _save_mid_json_for_run(run_id, body.raw_json)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        input_files["raw_json"] = raw_json_path
+        input_files["mid_json"] = mid_json_path
+        metadata["mid_json_leaf_count"] = (mid_json.get("mid_json") or {}).get("leaf_count")
+        metadata["mid_json_removed_wrapper_count"] = (mid_json.get("mid_json") or {}).get(
+            "removed_wrapper_count",
+        )
+    storage.update_meta(
+        run_id,
+        status="running",
+        input_files=input_files,
+        metadata=metadata,
+    )
+    try:
+        result = _analyze_text_zone_visual_from_raw_bytes(raw, run_id=run_id)
+        persist_v2_call(
+            storage,
+            run_id,
+            endpoint="/api/v2/analyze-text-zone-visual-json",
+            raw_banner_bytes=raw,
+            response=result,
+        )
+        storage.update_meta(run_id, status="completed")
+        return result
+    except HTTPException as exc:
+        persist_api_error(
+            storage,
+            run_id,
+            endpoint="/api/v2/analyze-text-zone-visual-json",
+            error_type="HTTPException",
+            detail=exc.detail,
+            raw_banner_bytes=raw,
+        )
+        storage.update_meta(run_id, status="failed", error=str(exc.detail)[:4000])
+        raise
+    except Exception as exc:
+        persist_api_error(
+            storage,
+            run_id,
+            endpoint="/api/v2/analyze-text-zone-visual-json",
+            error_type=type(exc).__name__,
+            detail=str(exc),
+            raw_banner_bytes=raw,
+        )
+        storage.update_meta(run_id, status="failed", error=str(exc)[:4000])
+        raise
 
 
 @app.get("/api/health", response_model=HealthResponse)
@@ -497,12 +710,17 @@ async def convert_from_plugin(body: ConvertRequest = Body(...)) -> ConvertRespon
         "raw.json",
         json.dumps(body.raw_json, ensure_ascii=False).encode("utf-8"),
     )
+    try:
+        mid_json_path, mid_json = _save_mid_json_for_run(run_id, body.raw_json)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
     assets = _save_convert_plugin_element_assets(run_id, body)
 
     input_files: dict[str, Any] = {
         "banner_image": banner_path,
         "raw_json": raw_json_path,
+        "mid_json": mid_json_path,
     }
     if assets.get("atlas_path"):
         input_files["element_atlas_png"] = assets["atlas_path"]
@@ -512,6 +730,7 @@ async def convert_from_plugin(body: ConvertRequest = Body(...)) -> ConvertRespon
         input_files=input_files,
         metadata={
             "source": "figma_plugin_convert",
+            "endpoint": "/api/convert",
             "mode": pipeline_mode,
             "target_width": body.target_width,
             "target_height": body.target_height,
@@ -528,13 +747,15 @@ async def convert_from_plugin(body: ConvertRequest = Body(...)) -> ConvertRespon
             "plugin_qwen_extra_image_count": 0,
             "element_atlas_regions_count_declared": body.element_atlas_regions_count,
             "element_image_refs_count_declared": body.element_image_refs_count,
+            "mid_json_leaf_count": (mid_json.get("mid_json") or {}).get("leaf_count"),
+            "mid_json_removed_wrapper_count": (mid_json.get("mid_json") or {}).get("removed_wrapper_count"),
         },
     )
 
     try:
         pipeline_result = runner.run(
             run_id=run_id,
-            raw_json_path=raw_json_path,
+            raw_json_path=mid_json_path,
             banner_image_path=banner_path,
             element_image_paths=None,
             atlas_image_path=assets.get("atlas_path"),
@@ -568,7 +789,7 @@ async def convert_from_plugin(body: ConvertRequest = Body(...)) -> ConvertRespon
     annotation_context = _build_convert_annotation_context(run_id, pipeline_result)
     convert_payload = build_convert_semantic_payload(
         semantic_graph,
-        body.raw_json,
+        mid_json,
         body.target_width,
         body.target_height,
         confidence_by_element_id=annotation_context["confidence_by_element_id"],
@@ -587,7 +808,7 @@ async def convert_from_plugin(body: ConvertRequest = Body(...)) -> ConvertRespon
             if isinstance(item, dict):
                 validation_warnings.append(str(item.get("message", "") or ""))
 
-    return ConvertResponse(
+    out = ConvertResponse(
         run_id=run_id,
         mode=pipeline_mode,
         frame=ConvertFrameSpec(**convert_payload["frame"]),
@@ -598,6 +819,7 @@ async def convert_from_plugin(body: ConvertRequest = Body(...)) -> ConvertRespon
         ),
         debug=ConvertDebug(
             semantic_graph_path=str(graph_path),
+            mid_json_path=str(mid_json_path),
             validation_report_path=vr_str,
             qwen_call_count=int((meta.get("metadata") or {}).get("qwen_call_count") or 0),
             qwen_mode=(meta.get("metadata") or {}).get("qwen_mode"),
@@ -608,6 +830,14 @@ async def convert_from_plugin(body: ConvertRequest = Body(...)) -> ConvertRespon
             low_confidence_examples=list(convert_payload.get("low_confidence_examples", []) or [])[:8],
         ),
     )
+    persist_convert_call(
+        storage,
+        run_id,
+        endpoint="/api/convert",
+        response=out,
+        banner_png_bytes=png_bytes,
+    )
+    return out
 
 
 @app.post("/api/run", response_model=RunCreateResponse)
@@ -640,6 +870,7 @@ async def create_run(
 
     banner_bytes = await banner_image.read()
     raw_json_bytes = await raw_json.read()
+    raw_json_payload = _load_raw_json_bytes(raw_json_bytes)
 
     banner_path = storage.save_upload_bytes(
         run_id,
@@ -651,6 +882,10 @@ async def create_run(
         _safe_filename(raw_json.filename),
         raw_json_bytes,
     )
+    try:
+        mid_json_path, mid_json = _save_mid_json_for_run(run_id, raw_json_payload)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
     element_paths: list[str] = []
     raw_uploads = element_images
@@ -680,21 +915,26 @@ async def create_run(
         input_files={
             "banner_image": banner_path,
             "raw_json": raw_json_path,
+            "mid_json": mid_json_path,
             "element_images": element_paths if element_paths else None,
         },
         metadata={
+            "source": "http_api",
+            "endpoint": "/api/run",
             "brand_family_override": brand_family_override,
             "language_override": language_override,
             "category_override": category_override,
             "use_qwen": use_qwen,
             "qwen_mode": (qwen_mode or "single_pass") if use_qwen else "off",
+            "mid_json_leaf_count": (mid_json.get("mid_json") or {}).get("leaf_count"),
+            "mid_json_removed_wrapper_count": (mid_json.get("mid_json") or {}).get("removed_wrapper_count"),
         },
     )
 
     try:
         runner.run(
             run_id=run_id,
-            raw_json_path=raw_json_path,
+            raw_json_path=mid_json_path,
             banner_image_path=banner_path,
             element_image_paths=element_paths if element_paths else None,
             atlas_image_path=None,
@@ -713,6 +953,17 @@ async def create_run(
         )
 
     meta = storage.read_meta(run_id)
+    persist_multipart_pipeline_run(
+        storage,
+        run_id,
+        endpoint="/api/run",
+        response_payload={
+            "run_id": run_id,
+            "status": meta["status"],
+            "message": "Run completed.",
+        },
+        banner_png_bytes=banner_bytes,
+    )
     return RunCreateResponse(
         run_id=run_id,
         status=meta["status"],

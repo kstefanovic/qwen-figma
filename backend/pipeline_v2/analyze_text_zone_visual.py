@@ -11,6 +11,7 @@ from env_load import default_qwen_base_url
 from backend.text_zone_age_badge_guard import should_strip_age_badge_group_vs_brand
 
 from backend.pipeline_v2.image_utils import decode_banner_raster, resize_and_encode_for_zone_qwen
+from backend.pipeline_v2.paddle_ocr_bbox_refine import refine_text_zone_bboxes_with_paddle_ocr
 from backend.pipeline_v2.schemas import (
     AnalyzeTextZoneVisualDebug,
     AnalyzeTextZoneVisualResponse,
@@ -415,10 +416,361 @@ def _dedupe_text_zone_group_items(
     return [by_role[r] for r in order if r in by_role]
 
 
+_NON_OVERLAP_GROUP_ROLES = frozenset({"brand_group", "headline_group", "legal_text_group"})
+_BRAND_NAME_CHILD_ROLES = frozenset({"brand_name", "brand_name_first", "brand_name_second"})
+_STRUCTURAL_GROUP_ORDER = (
+    "brand_group",
+    "headline_group",
+    "legal_text_group",
+    "age_badge_group",
+    "hero_image_group",
+    "star_group",
+    "glow_group",
+    "bg_shape_group",
+)
+
+
+def _bbox_union_for_children(children: list[TextZoneChildItem]) -> NormalizedBbox | None:
+    if not children:
+        return None
+    x0 = min(c.bbox.x for c in children)
+    y0 = min(c.bbox.y for c in children)
+    x1 = max(c.bbox.x + c.bbox.width for c in children)
+    y1 = max(c.bbox.y + c.bbox.height for c in children)
+    return _clamp_norm_bbox_model(x0, y0, x1 - x0, y1 - y0)
+
+
+def _placeholder_bbox() -> NormalizedBbox:
+    # Positive dimensions are required by the schema; this is visually negligible.
+    return NormalizedBbox(x=0.0, y=0.0, width=1e-6, height=1e-6)
+
+
+def _preferred_group_bbox(g: TextZoneGroupItem) -> NormalizedBbox:
+    if g.role == "brand_group":
+        name_children = [c for c in g.children if c.role in _BRAND_NAME_CHILD_ROLES]
+        return _bbox_union_for_children(name_children) or g.bbox
+    if g.role in ("headline_group", "legal_text_group"):
+        return _bbox_union_for_children(g.children) or g.bbox
+    return g.bbox
+
+
+def _bbox_overlaps(a: NormalizedBbox, b: NormalizedBbox) -> bool:
+    ax1 = a.x + a.width
+    ay1 = a.y + a.height
+    bx1 = b.x + b.width
+    by1 = b.y + b.height
+    return min(ax1, bx1) > max(a.x, b.x) and min(ay1, by1) > max(a.y, b.y)
+
+
+def _bbox_center_y(b: NormalizedBbox) -> float:
+    return b.y + b.height / 2.0
+
+
+def _bbox_bottom(b: NormalizedBbox) -> float:
+    return b.y + b.height
+
+
+def _replace_group_bbox(
+    g: TextZoneGroupItem,
+    bbox: NormalizedBbox,
+    *,
+    reason_suffix: str | None = None,
+    sync_single_legal_child: bool = False,
+) -> TextZoneGroupItem:
+    reason = g.reason
+    if reason_suffix and reason_suffix not in reason:
+        reason = (reason + f" [{reason_suffix}]").strip()
+    children = g.children
+    if sync_single_legal_child and g.role == "legal_text_group" and len(children) == 1:
+        child = children[0]
+        if child.role == "legal_text":
+            child_reason = child.reason
+            if reason_suffix and reason_suffix not in child_reason:
+                child_reason = (child_reason + f" [{reason_suffix}]").strip()
+            children = [
+                TextZoneChildItem(
+                    role=child.role,
+                    text=child.text,
+                    bbox=bbox,
+                    confidence=child.confidence,
+                    reason=child_reason,
+                ),
+            ]
+    return TextZoneGroupItem(
+        role=g.role,
+        bbox=bbox,
+        confidence=g.confidence,
+        reason=reason,
+        children=children,
+    )
+
+
+def _normalize_text_zone_group_bboxes(
+    groups: list[TextZoneGroupItem],
+    warnings: list[str],
+) -> list[TextZoneGroupItem]:
+    """
+    Top-level groups must not overlap each other, except age_badge_group is ignored.
+    Child bboxes may overlap within their own group.
+    """
+    by_role = {g.role: g for g in groups}
+    changed = 0
+
+    for role in _NON_OVERLAP_GROUP_ROLES:
+        g = by_role.get(role)
+        if g is None:
+            continue
+        bbox = _preferred_group_bbox(g)
+        if bbox.model_dump() != g.bbox.model_dump():
+            by_role[role] = _replace_group_bbox(g, bbox, reason_suffix="group bbox normalized")
+            changed += 1
+
+    cared = [g for g in by_role.values() if g.role in _NON_OVERLAP_GROUP_ROLES]
+    for _ in range(4):
+        fixed_this_round = 0
+        cared = [g for g in by_role.values() if g.role in _NON_OVERLAP_GROUP_ROLES]
+        for i in range(len(cared)):
+            for j in range(i + 1, len(cared)):
+                a = by_role.get(cared[i].role)
+                b = by_role.get(cared[j].role)
+                if a is None or b is None or not _bbox_overlaps(a.bbox, b.bbox):
+                    continue
+
+                # Legal copy is identified by smallest text rows. If it conflicts, preserve legal
+                # and trim the other top-level group away from it.
+                if a.role == "legal_text_group" or b.role == "legal_text_group":
+                    legal = a if a.role == "legal_text_group" else b
+                    other = b if legal is a else a
+                    if _bbox_center_y(other.bbox) <= _bbox_center_y(legal.bbox):
+                        new_other = _clamp_norm_bbox_model(
+                            other.bbox.x,
+                            other.bbox.y,
+                            other.bbox.width,
+                            legal.bbox.y - other.bbox.y,
+                        )
+                    else:
+                        legal_bottom = _bbox_bottom(legal.bbox)
+                        new_other = _clamp_norm_bbox_model(
+                            other.bbox.x,
+                            legal_bottom,
+                            other.bbox.width,
+                            _bbox_bottom(other.bbox) - legal_bottom,
+                        )
+                    if new_other is not None:
+                        by_role[other.role] = _replace_group_bbox(
+                            other,
+                            new_other,
+                            reason_suffix="group bbox de-overlapped",
+                            sync_single_legal_child=False,
+                        )
+                        changed += 1
+                        fixed_this_round += 1
+                    continue
+
+                upper, lower = (a, b) if _bbox_center_y(a.bbox) <= _bbox_center_y(b.bbox) else (b, a)
+                upper_bottom = _bbox_bottom(upper.bbox)
+                lower_bottom = _bbox_bottom(lower.bbox)
+                if lower_bottom - upper_bottom > 1e-4:
+                    new_lower = _clamp_norm_bbox_model(
+                        lower.bbox.x,
+                        upper_bottom,
+                        lower.bbox.width,
+                        lower_bottom - upper_bottom,
+                    )
+                    if new_lower is not None:
+                        by_role[lower.role] = _replace_group_bbox(
+                            lower,
+                            new_lower,
+                            reason_suffix="group bbox de-overlapped",
+                            sync_single_legal_child=True,
+                        )
+                        changed += 1
+                        fixed_this_round += 1
+                elif lower.bbox.y - upper.bbox.y > 1e-4:
+                    new_upper = _clamp_norm_bbox_model(
+                        upper.bbox.x,
+                        upper.bbox.y,
+                        upper.bbox.width,
+                        lower.bbox.y - upper.bbox.y,
+                    )
+                    if new_upper is not None:
+                        by_role[upper.role] = _replace_group_bbox(
+                            upper,
+                            new_upper,
+                            reason_suffix="group bbox de-overlapped",
+                            sync_single_legal_child=True,
+                        )
+                        changed += 1
+                        fixed_this_round += 1
+        if fixed_this_round == 0:
+            break
+
+    if changed:
+        warnings.append(
+            f"Group bbox normalization: updated {changed} top-level bbox(es); "
+            "brand/headline/legal groups do not overlap (age_badge ignored).",
+        )
+    return [by_role[g.role] for g in groups if g.role in by_role]
+
+
+def _structural_child(role: str) -> TextZoneChildItem:
+    return TextZoneChildItem(role=role, text="", bbox=_placeholder_bbox(), confidence=0.0, reason="Structural placeholder")
+
+
+def _logo_structural_child(children: list[TextZoneChildItem]) -> TextZoneChildItem:
+    existing_logo = next((c for c in children if c.role == "logo"), None)
+    logo_fore = next((c for c in children if c.role == "logo_fore"), None)
+    logo_back = next((c for c in children if c.role == "logo_back"), None)
+    nested = [c for c in (logo_fore, logo_back) if c is not None]
+    bbox = _bbox_union_for_children(nested) or (existing_logo.bbox if existing_logo is not None else _placeholder_bbox())
+    return TextZoneChildItem(
+        role="logo",
+        text="",
+        bbox=bbox,
+        confidence=max([c.confidence for c in nested] + ([existing_logo.confidence] if existing_logo else [0.0])),
+        reason=(existing_logo.reason if existing_logo is not None else "Logo structural parent"),
+        children=nested,
+    )
+
+
+def _infer_hero_bbox_from_zone(groups: list[TextZoneGroupItem], zone_type: str) -> NormalizedBbox | None:
+    text_groups = [g for g in groups if g.role in _NON_OVERLAP_GROUP_ROLES]
+    if not text_groups:
+        return None
+    zt = (zone_type or "").strip()
+    if zt == "upper_image_lower_text":
+        top_text_y = min(g.bbox.y for g in text_groups)
+        if top_text_y > 0.08:
+            return _clamp_norm_bbox_model(0.0, 0.0, 1.0, top_text_y)
+        return None
+    if zt == "left_text_right_image":
+        min_x = min(g.bbox.x for g in text_groups)
+        max_x = max(g.bbox.x + g.bbox.width for g in text_groups)
+        text_center_x = (min_x + max_x) / 2.0
+        if text_center_x < 0.5 and max_x < 0.92:
+            return _clamp_norm_bbox_model(max_x, 0.0, 1.0 - max_x, 1.0)
+        if text_center_x >= 0.5 and min_x > 0.08:
+            return _clamp_norm_bbox_model(0.0, 0.0, min_x, 1.0)
+        return None
+    if zt == "upper_text_mid_image_lower_text":
+        ordered = sorted(text_groups, key=lambda g: g.bbox.y)
+        if len(ordered) < 2:
+            return None
+        upper_bottom = min(0.98, max(g.bbox.y + g.bbox.height for g in ordered[:-1]))
+        lower_top = ordered[-1].bbox.y
+        if lower_top - upper_bottom > 0.08:
+            return _clamp_norm_bbox_model(0.0, upper_bottom, 1.0, lower_top - upper_bottom)
+    return None
+
+
+def _enrich_text_zone_structure(
+    groups: list[TextZoneGroupItem],
+    warnings: list[str],
+    *,
+    zone_type: str,
+) -> list[TextZoneGroupItem]:
+    by_role = {g.role: g for g in groups}
+
+    brand = by_role.get("brand_group")
+    if brand is not None:
+        first = next((c for c in brand.children if c.role == "brand_name_first"), None)
+        single = next((c for c in brand.children if c.role == "brand_name"), None)
+        second = next((c for c in brand.children if c.role == "brand_name_second"), None)
+        logo = _logo_structural_child(brand.children)
+        brand_children = [c for c in (first or single, logo, second) if c is not None]
+        by_role["brand_group"] = TextZoneGroupItem(
+            role=brand.role,
+            bbox=brand.bbox,
+            confidence=brand.confidence,
+            reason=brand.reason,
+            children=brand_children,
+        )
+
+    headline = by_role.get("headline_group")
+    if headline is not None:
+        head = next((c for c in headline.children if c.role == "headline"), None)
+        sub = next((c for c in headline.children if c.role == "subheadline"), None)
+        if sub is None:
+            sub = next(
+                (
+                    c
+                    for c in headline.children
+                    if c.role
+                    in (
+                        "subheadline_delivery_time",
+                        "subheadline_weight",
+                        "product_name",
+                        "subheadline_discount",
+                    )
+                ),
+                None,
+            )
+            if sub is not None:
+                sub = TextZoneChildItem(
+                    role="subheadline",
+                    text=sub.text,
+                    bbox=sub.bbox,
+                    confidence=sub.confidence,
+                    reason=(sub.reason + " [structural role: subheadline]").strip(),
+                    children=sub.children,
+                )
+        headline_children = [c for c in (head, sub) if c is not None]
+        by_role["headline_group"] = TextZoneGroupItem(
+            role=headline.role,
+            bbox=headline.bbox,
+            confidence=headline.confidence,
+            reason=headline.reason,
+            children=headline_children,
+        )
+
+    hero = by_role.get("hero_image_group")
+    if hero is None or not hero.children:
+        inferred_hero_bbox = _infer_hero_bbox_from_zone(list(by_role.values()), zone_type)
+        if inferred_hero_bbox is not None:
+            hero_child = TextZoneChildItem(
+                role="hero_image",
+                text="",
+                bbox=inferred_hero_bbox,
+                confidence=0.55,
+                reason=f"Inferred from zone_type={zone_type!r} image zone",
+            )
+            by_role["hero_image_group"] = TextZoneGroupItem(
+                role="hero_image_group",
+                bbox=inferred_hero_bbox,
+                confidence=0.55,
+                reason=f"Inferred from zone_type={zone_type!r} image zone",
+                children=[hero_child],
+            )
+            warnings.append("Hero image fallback: added hero_image from zone_type image region.")
+
+    for role in ("hero_image_group", "star_group", "glow_group", "bg_shape_group"):
+        if role not in by_role:
+            by_role[role] = TextZoneGroupItem(
+                role=role,
+                bbox=_placeholder_bbox(),
+                confidence=0.0,
+                reason="Structural placeholder; not detected by current text-zone logic",
+                children=[],
+            )
+        elif not by_role[role].children:
+            g = by_role[role]
+            by_role[role] = TextZoneGroupItem(
+                role=g.role,
+                bbox=_placeholder_bbox(),
+                confidence=g.confidence,
+                reason=g.reason,
+                children=[],
+            )
+
+    warnings.append("Structural enrichment: normalized text_zone groups to requested schema.")
+    return [by_role[r] for r in _STRUCTURAL_GROUP_ORDER if r in by_role]
+
+
 def analyze_text_zone_visual_from_banner_bytes(
     raw_banner_bytes: bytes,
     *,
     qwen_base_url: str | None = None,
+    run_id: str | None = None,
 ) -> AnalyzeTextZoneVisualResponse:
     """
     One Qwen ``POST /analyze-text-zone-visual`` call: orientation, zone_type, text_zone.groups.
@@ -426,11 +778,11 @@ def analyze_text_zone_visual_from_banner_bytes(
     """
     t_total0 = time.perf_counter()
     timings: dict[str, float] = {}
-    run_id = str(uuid.uuid4())
+    rid = (run_id or "").strip() or str(uuid.uuid4())
     warnings: list[str] = []
 
     t0 = time.perf_counter()
-    logger.info("pipeline_v2 analyze_text_zone_visual receive_request run_id=%s", run_id)
+    logger.info("pipeline_v2 analyze_text_zone_visual receive_request run_id=%s", rid)
     timings["receive_request"] = time.perf_counter() - t0
 
     t0 = time.perf_counter()
@@ -531,6 +883,9 @@ def analyze_text_zone_visual_from_banner_bytes(
     _warn_headline_group_missing_subheadline_support(groups_out, warnings)
     _warn_brand_group_missing_word_children(groups_out, warnings)
     _warn_age_badge_group_incomplete(groups_out, warnings)
+    groups_out = refine_text_zone_bboxes_with_paddle_ocr(image, groups_out, warnings)
+    groups_out = _normalize_text_zone_group_bboxes(groups_out, warnings)
+    groups_out = _enrich_text_zone_structure(groups_out, warnings, zone_type=zone_type)
 
     timings["parse_qwen_json"] = time.perf_counter() - t0
     timings["total"] = time.perf_counter() - t_total0
@@ -542,7 +897,7 @@ def analyze_text_zone_visual_from_banner_bytes(
         "run_id=%s original_image=%dx%d resized_image=%dx%d qwen_elapsed_seconds=%.4f "
         "orientation=%r zone_type=%r text_zone_group_count=%d groups=%r child_counts_per_group=%s "
         "validation_warning_count=%d total_seconds=%.4f",
-        run_id,
+        rid,
         orig_w,
         orig_h,
         rw,
@@ -575,7 +930,7 @@ def analyze_text_zone_visual_from_banner_bytes(
         logger.info("pipeline_v2 analyze_text_zone_visual validation_warnings=%s", warnings)
 
     return AnalyzeTextZoneVisualResponse(
-        run_id=run_id,
+        run_id=rid,
         mode="text_zone_visual",
         orientation=orientation,
         zone_type=zone_type,

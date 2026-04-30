@@ -6,14 +6,16 @@ import uvicorn
 
 from env_load import load_project_env
 
-load_project_env()
+# For the model service, repo `.env` is the source of truth. PM2 can keep stale
+# environment values across restarts, so force `.env` to override inherited keys.
+load_project_env(override=True)
 
 from qwen_service.app import create_app, resolve_qwen_vl_family
 
 logger = logging.getLogger(__name__)
 
 
-MODEL_PATH = os.environ.get("QWEN_MODEL_PATH", "Qwen3-VL-8B-Instruct")
+MODEL_PATH = os.environ.get("QWEN_MODEL_PATH", "Qwen2.5-VL-7B-Instruct")
 # qwen2_5 | qwen3 — empty = infer from QWEN_MODEL_PATH (e.g. Qwen3-VL-* → qwen3)
 VL_FAMILY = os.environ.get("QWEN_VL_FAMILY", "").strip()
 DEVICE = os.environ.get("QWEN_DEVICE", "cuda:1")

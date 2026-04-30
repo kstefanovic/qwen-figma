@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -19,6 +19,13 @@ TextZoneChildRole = Literal[
     "subheadline_discount",
     "legal_text",
     "age_badge",
+    "hero_image",
+    "here_image",
+    "star_1",
+    "star_2",
+    "glow_1",
+    "glow_2",
+    "bg_shape",
 ]
 
 
@@ -26,6 +33,7 @@ class ClassifyZonePluginRequest(BaseModel):
     """Figma plugin: same transport as ``/api/convert`` (strict PNG base64, no multipart)."""
 
     banner_png_base64: str
+    raw_json: dict[str, Any] | None = None
 
 
 class ClassifyZoneDebug(BaseModel):
@@ -70,10 +78,20 @@ class TextZoneChildItem(BaseModel):
     bbox: NormalizedBbox
     confidence: float = 0.0
     reason: str = ""
+    children: list["TextZoneChildItem"] = Field(default_factory=list)
 
 
 class TextZoneGroupItem(BaseModel):
-    role: Literal["brand_group", "headline_group", "age_badge_group", "legal_text_group"]
+    role: Literal[
+        "brand_group",
+        "headline_group",
+        "legal_text_group",
+        "age_badge_group",
+        "hero_image_group",
+        "star_group",
+        "glow_group",
+        "bg_shape_group",
+    ]
     bbox: NormalizedBbox
     confidence: float = 0.0
     reason: str = ""

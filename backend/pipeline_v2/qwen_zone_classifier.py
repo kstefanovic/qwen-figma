@@ -30,6 +30,7 @@ def classify_zone_from_banner_bytes(
     raw_banner_bytes: bytes,
     *,
     qwen_base_url: str | None = None,
+    run_id: str | None = None,
 ) -> ClassifyZoneResponse:
     """
     One Qwen ``POST /classify-zone`` call (orientation + zone_type only).
@@ -37,10 +38,10 @@ def classify_zone_from_banner_bytes(
     """
     t_total0 = time.perf_counter()
     timings: dict[str, float] = {}
-    run_id = str(uuid.uuid4())
+    rid = (run_id or "").strip() or str(uuid.uuid4())
 
     t0 = time.perf_counter()
-    logger.info("pipeline_v2 timing receive_request: run_id=%s", run_id)
+    logger.info("pipeline_v2 timing receive_request: run_id=%s", rid)
     timings["receive_request"] = time.perf_counter() - t0
 
     t0 = time.perf_counter()
@@ -91,7 +92,7 @@ def classify_zone_from_banner_bytes(
     logger.info(
         "pipeline_v2 timings run_id=%s receive_request=%.3fs load_image=%.3fs resize_image=%.3fs "
         "qwen_classify_zone=%.3fs parse_qwen_json=%.3fs total=%.3fs",
-        run_id,
+        rid,
         timings.get("receive_request", 0.0),
         timings.get("load_image", 0.0),
         timings.get("resize_image", 0.0),
@@ -101,7 +102,7 @@ def classify_zone_from_banner_bytes(
     )
 
     return ClassifyZoneResponse(
-        run_id=run_id,
+        run_id=rid,
         mode="zone_classification",
         zone_type=zone_type,
         orientation=orientation,

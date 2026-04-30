@@ -211,6 +211,7 @@ class ConvertFrameSpec(BaseModel):
 
 class ConvertDebug(BaseModel):
     semantic_graph_path: str
+    mid_json_path: Optional[str] = None
     validation_report_path: Optional[str] = None
     qwen_call_count: int = 0
     qwen_mode: Optional[str] = None
