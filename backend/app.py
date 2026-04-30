@@ -9,6 +9,7 @@ import base64
 import binascii
 import io
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Any, Optional
@@ -32,6 +33,7 @@ from backend.api_run_artifacts import (
     repo_runs_dir,
 )
 from backend.convert_scene import build_convert_semantic_payload
+from backend.final_json_mapper import build_final_json
 from backend.mid_json import build_mid_json
 from backend.pipeline_v2.analyze_text_zone_visual import analyze_text_zone_visual_from_banner_bytes
 from backend.pipeline_v2.qwen_zone_classifier import classify_zone_from_banner_bytes
@@ -63,6 +65,7 @@ from backend.storage import RunStorage
 
 RUNS_DIR = repo_runs_dir()
 QWEN_BASE_URL = default_qwen_base_url()
+logger = logging.getLogger(__name__)
 
 
 def _optional_form_str(value: Optional[str]) -> Optional[str]:
@@ -601,6 +604,7 @@ async def analyze_text_zone_visual_v2_json(
         "source": "http_api",
         "endpoint": "/api/v2/analyze-text-zone-visual-json",
     }
+    mid_json: dict[str, Any] | None = None
     if body.raw_json is not None:
         raw_json_path = storage.save_upload_bytes(
             run_id,
@@ -625,6 +629,12 @@ async def analyze_text_zone_visual_v2_json(
     )
     try:
         result = _analyze_text_zone_visual_from_raw_bytes(raw, run_id=run_id)
+        if mid_json is not None:
+            try:
+                final_json = build_final_json(mid_json, result.model_dump(mode="json"))
+                result = result.model_copy(update={"final_json": final_json})
+            except Exception as exc:
+                logger.warning("analyze_text_zone_visual_v2_json: final_json generation failed run_id=%s: %s", run_id, exc)
         persist_v2_call(
             storage,
             run_id,

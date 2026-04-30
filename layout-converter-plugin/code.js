@@ -844,6 +844,88 @@ function applySemanticsToClone(result, convertedFrame) {
   };
 }
 
+function applyFinalJsonToClone(finalJson, convertedFrame) {
+  const preservedRootName = convertedFrame.name;
+  const { map: nodeByOriginalId, mapped } = collectClonedNodesByOriginalId(convertedFrame);
+  const pathNodeMap = buildPathNodeMap(convertedFrame);
+  let renamed = 0;
+  let groupsCreated = 0;
+  let groupsRenamed = 0;
+  const missing = [];
+
+  function resolveFinalNode(item) {
+    if (!item || typeof item !== "object") return null;
+    const id = String(item.id || "").trim();
+    const path = String(item.path || "").trim();
+    if (id && nodeByOriginalId.has(id)) return nodeByOriginalId.get(id);
+    if (path && pathNodeMap.has(path)) return pathNodeMap.get(path);
+    return null;
+  }
+
+  function applyTree(item) {
+    if (!item || typeof item !== "object") return null;
+    const children = Array.isArray(item.children) ? item.children : [];
+    const exactNode = resolveFinalNode(item);
+
+    if (exactNode && exactNode.id !== convertedFrame.id) {
+      if (setSemanticName(exactNode, item.name || item.role || item.type)) renamed++;
+      for (const child of children) applyTree(child);
+      return exactNode;
+    }
+
+    const matchedChildren = [];
+    for (const child of children) {
+      const childNode = applyTree(child);
+      if (childNode) matchedChildren.push(childNode);
+    }
+
+    if (matchedChildren.length === 0) {
+      if (item.name && item.id) missing.push(String(item.id));
+      return null;
+    }
+
+    if (canSafelyGroup(matchedChildren)) {
+      try {
+        const groupNode = figma.group(matchedChildren, matchedChildren[0].parent);
+        if (setSemanticName(groupNode, item.name || item.role || "semantic_group")) {
+          groupsCreated++;
+          return groupNode;
+        }
+      } catch (e) {
+        console.warn("Failed grouping final_json children:", item && item.name, e);
+      }
+    }
+
+    const parentMap = new Map();
+    for (const node of matchedChildren) {
+      if (node.parent) parentMap.set(node.parent.id, node.parent);
+    }
+    if (parentMap.size === 1) {
+      const parent = Array.from(parentMap.values())[0];
+      if (parent && parent.id !== convertedFrame.id && setSemanticName(parent, item.name || item.role || "semantic_group")) {
+        groupsRenamed++;
+        return parent;
+      }
+    }
+
+    return matchedChildren[0];
+  }
+
+  for (const child of Array.isArray(finalJson && finalJson.children) ? finalJson.children : []) {
+    applyTree(child);
+  }
+
+  convertedFrame.name = preservedRootName;
+  return {
+    mapped,
+    renamed,
+    groupsCreated,
+    groupsRenamed,
+    missing,
+    remainingGeneric: collectGenericNodes(convertedFrame),
+  };
+}
+
 function getSelectionInfo() {
   const selection = figma.currentPage.selection;
 
@@ -899,6 +981,7 @@ figma.ui.onmessage = async (msg) => {
     }
     const requestUrl = backendUrl + "/api/v2/analyze-text-zone-visual-json";
     try {
+      const stampedNodeCount = stampOriginalNodeIds(selectedFrame);
       const origin = getOrigin(selectedFrame);
       const rawJson = serializeNode(selectedFrame, origin, "");
       rawJson.templateId = "figma_plugin";
@@ -934,6 +1017,15 @@ figma.ui.onmessage = async (msg) => {
       if (!data || typeof data !== "object") {
         throw new Error("Invalid JSON from backend.");
       }
+      let finalSummary = null;
+      if (data.final_json && typeof data.final_json === "object") {
+        postStatus("Creating semantic clone from final JSON…");
+        const convertedFrame = cloneFrameBeside(selectedFrame);
+        finalSummary = applyFinalJsonToClone(data.final_json, convertedFrame);
+        figma.currentPage.selection = [convertedFrame];
+        figma.viewport.scrollAndZoomIntoView([selectedFrame, convertedFrame]);
+        console.log("Final JSON clone summary:", finalSummary);
+      }
       postStatus("Zone + text-zone analysis complete.");
       figma.ui.postMessage({
         type: "zone-classify-result",
@@ -945,7 +1037,8 @@ figma.ui.onmessage = async (msg) => {
           data.zone_type +
           " (" +
           Number(data.confidence).toFixed(2) +
-          ")",
+          ")" +
+          (finalSummary ? `; semantic clone renamed ${finalSummary.renamed} nodes` : ""),
         { timeout: 5 },
       );
       figma.ui.postMessage({ type: "done" });

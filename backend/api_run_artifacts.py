@@ -8,6 +8,7 @@ from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont
 
+from backend.final_json_mapper import build_final_json
 from backend.pipeline_v2.schemas import AnalyzeTextZoneVisualResponse, ClassifyZoneResponse
 from backend.storage import RunStorage
 
@@ -62,6 +63,18 @@ def _norm_rect_to_pixels(
         d = bbox
     else:
         return None
+    if "bounds" in d and isinstance(d.get("bounds"), dict):
+        d = d["bounds"]
+        try:
+            x0 = max(0, min(pw - 1, int(round(float(d.get("x", 0) or 0)))))
+            y0 = max(0, min(ph - 1, int(round(float(d.get("y", 0) or 0)))))
+            x1 = max(0, min(pw, int(round(float(d.get("x", 0) or 0) + float(d.get("width", 0) or 0)))))
+            y1 = max(0, min(ph, int(round(float(d.get("y", 0) or 0) + float(d.get("height", 0) or 0)))))
+        except (TypeError, ValueError):
+            return None
+        if x1 <= x0 or y1 <= y0:
+            return None
+        return x0, y0, x1, y1
     try:
         x = float(d.get("x", 0) or 0)
         y = float(d.get("y", 0) or 0)
@@ -221,6 +234,40 @@ def save_png(path: Path, im: Image.Image) -> None:
     path.write_bytes(buf.getvalue())
 
 
+def _draw_final_json_group(
+    dr: ImageDraw.ImageDraw,
+    item: Any,
+    pw: int,
+    ph: int,
+    *,
+    font: Any,
+    depth: int = 0,
+) -> None:
+    if not isinstance(item, dict):
+        return
+    r = _norm_rect_to_pixels(item.get("bbox") if item.get("bbox") is not None else item, pw, ph)
+    if r:
+        color = (255, 220, 0) if depth else (0, 255, 180)
+        dr.rectangle(r, outline=color, width=2 if depth else 3)
+        if font:
+            dr.text((r[0] + 2, max(0, r[1] - 11 + depth * 9)), str(item.get("role", "") or ""), fill=color, font=font)
+    for child in item.get("children") or []:
+        _draw_final_json_group(dr, child, pw, ph, font=font, depth=depth + 1)
+
+
+def draw_final_json_on_image(rgb: Image.Image, final_json: dict[str, Any]) -> Image.Image:
+    out = rgb.copy()
+    dr = ImageDraw.Draw(out)
+    pw, ph = out.size
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+    for group in final_json.get("groups") or final_json.get("children") or []:
+        _draw_final_json_group(dr, group, pw, ph, font=font)
+    return out
+
+
 def persist_v2_call(
     storage: RunStorage,
     run_id: str,
@@ -233,9 +280,21 @@ def persist_v2_call(
     out_dir = ensure_output_dir(storage, run_id)
     payload = response.model_dump(mode="json")
     _write_json(out_dir / "response.json", payload)
+    _write_json(out_dir / "qwen_json.json", payload)
+    final_json: dict[str, Any] | None = None
+    mid_path = storage.get_input_dir(run_id) / "mid.json"
+    if mid_path.exists() and isinstance(response, AnalyzeTextZoneVisualResponse):
+        try:
+            mid_json = json.loads(mid_path.read_text(encoding="utf-8"))
+            final_json = build_final_json(mid_json, payload)
+            _write_json(out_dir / "final_json.json", final_json)
+        except Exception as exc:
+            logger.warning("persist_v2_call: final_json failed run_id=%s: %s", run_id, exc)
     try:
         base = _decode_banner_rgb(raw_banner_bytes)
-        if isinstance(response, AnalyzeTextZoneVisualResponse):
+        if final_json is not None:
+            ann = draw_final_json_on_image(base, final_json)
+        elif isinstance(response, AnalyzeTextZoneVisualResponse):
             ann = draw_text_zone_on_image(base, response.text_zone)
         else:
             ann = base.copy()

@@ -117,6 +117,7 @@ class AnalyzeTextZoneVisualResponse(BaseModel):
     reason: str = ""
     text_zone: TextZoneVisual
     debug: AnalyzeTextZoneVisualDebug
+    final_json: dict[str, Any] | None = None
 
     @field_validator("orientation")
     @classmethod
