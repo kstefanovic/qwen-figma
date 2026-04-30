@@ -290,17 +290,6 @@ def persist_v2_call(
             _write_json(out_dir / "final_json.json", final_json)
         except Exception as exc:
             logger.warning("persist_v2_call: final_json failed run_id=%s: %s", run_id, exc)
-    try:
-        base = _decode_banner_rgb(raw_banner_bytes)
-        if final_json is not None:
-            ann = draw_final_json_on_image(base, final_json)
-        elif isinstance(response, AnalyzeTextZoneVisualResponse):
-            ann = draw_text_zone_on_image(base, response.text_zone)
-        else:
-            ann = base.copy()
-        save_png(out_dir / "banner_annotate.png", ann)
-    except Exception as exc:
-        logger.warning("persist_v2_call: banner_annotate.png failed run_id=%s: %s", run_id, exc)
 
 
 def persist_convert_call(
@@ -313,13 +302,6 @@ def persist_convert_call(
 ) -> None:
     out_dir = ensure_output_dir(storage, run_id)
     _write_json(out_dir / "response.json", response.model_dump(mode="json"))
-    try:
-        base = _decode_banner_rgb(banner_png_bytes)
-        updates = [u.model_dump(mode="json") for u in response.updates]
-        ann = draw_convert_updates_on_image(base, updates)
-        save_png(out_dir / "banner_annotate.png", ann)
-    except Exception as exc:
-        logger.warning("persist_convert_call: banner_annotate.png failed run_id=%s: %s", run_id, exc)
 
 
 def draw_candidates_json_on_image(rgb: Image.Image, candidates_payload: dict[str, Any]) -> Image.Image:
@@ -366,17 +348,6 @@ def persist_multipart_pipeline_run(
     """After ``POST /api/run``: mirror summary to ``output/`` and annotate from ``04_candidates.json``."""
     out_dir = ensure_output_dir(storage, run_id)
     _write_json(out_dir / "response.json", response_payload)
-    cand_path = storage.get_intermediate_dir(run_id) / "04_candidates.json"
-    try:
-        base = _decode_banner_rgb(banner_png_bytes)
-        if cand_path.exists():
-            data = json.loads(cand_path.read_text(encoding="utf-8"))
-            ann = draw_candidates_json_on_image(base, data if isinstance(data, dict) else {})
-        else:
-            ann = base.copy()
-        save_png(out_dir / "banner_annotate.png", ann)
-    except Exception as exc:
-        logger.warning("persist_multipart_pipeline_run: annotate failed run_id=%s: %s", run_id, exc)
 
 
 def persist_api_error(
@@ -393,8 +364,3 @@ def persist_api_error(
         out_dir / "error.json",
         {"endpoint": endpoint, "error_type": error_type, "detail": detail},
     )
-    if raw_banner_bytes:
-        try:
-            save_png(out_dir / "banner_annotate.png", _decode_banner_rgb(raw_banner_bytes))
-        except Exception as exc:
-            logger.warning("persist_api_error: banner copy failed run_id=%s: %s", run_id, exc)

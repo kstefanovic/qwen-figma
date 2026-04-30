@@ -526,6 +526,35 @@ function cloneFrameBeside(sourceFrame) {
   return convertedFrame;
 }
 
+function selectionBounds(nodes) {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const node of nodes) {
+    if (!node || !("absoluteTransform" in node) || !("width" in node) || !("height" in node)) continue;
+    const t = node.absoluteTransform;
+    const x = t[0][2];
+    const y = t[1][2];
+    minX = Math.min(minX, x);
+    minY = Math.min(minY, y);
+    maxX = Math.max(maxX, x + node.width);
+    maxY = Math.max(maxY, y + node.height);
+  }
+  if (!Number.isFinite(minX)) return { x: 0, y: 0, width: 0, height: 0, right: 0, bottom: 0 };
+  return { x: minX, y: minY, width: maxX - minX, height: maxY - minY, right: maxX, bottom: maxY };
+}
+
+function cloneFrameToSemanticOutputArea(sourceFrame, selectionBox, index) {
+  const gap = Math.max(800, selectionBox.width * 0.45);
+  const convertedFrame = sourceFrame.clone();
+  convertedFrame.x = selectionBox.right + gap;
+  convertedFrame.y = selectionBox.y + index * (sourceFrame.height + 120);
+  convertedFrame.name = sourceFrame.name;
+  figma.currentPage.appendChild(convertedFrame);
+  return convertedFrame;
+}
+
 function buildPathNodeMap(root) {
   const map = new Map();
   map.set("", root);
@@ -615,6 +644,37 @@ function canSafelyGroup(children) {
   if (parent.type === "INSTANCE" || parent.type === "COMPONENT" || parent.type === "COMPONENT_SET") return false;
   if (children.some((child) => "isMask" in child && child.isMask)) return false;
   return true;
+}
+
+function canSafelyUngroup(node) {
+  if (!node || !("children" in node) || !Array.isArray(node.children)) return false;
+  if (!isGenericLayerName(node.name)) return false;
+  if (node.type === "INSTANCE" || node.type === "COMPONENT" || node.type === "COMPONENT_SET") return false;
+  if (node.children.some((child) => "isMask" in child && child.isMask)) return false;
+  return true;
+}
+
+function unwrapAnonymousWrappers(root) {
+  let removed = 0;
+
+  function walk(node) {
+    if (!node || !("children" in node) || !Array.isArray(node.children)) return;
+    for (const child of [...node.children]) {
+      walk(child);
+    }
+    for (const child of [...node.children]) {
+      if (!canSafelyUngroup(child)) continue;
+      try {
+        figma.ungroup(child);
+        removed++;
+      } catch (e) {
+        console.warn("Failed ungrouping anonymous wrapper:", child && child.name, e);
+      }
+    }
+  }
+
+  walk(root);
+  return removed;
 }
 
 function applySemanticFallbackName(node, groupName) {
@@ -851,6 +911,7 @@ function applyFinalJsonToClone(finalJson, convertedFrame) {
   let renamed = 0;
   let groupsCreated = 0;
   let groupsRenamed = 0;
+  let wrappersRemoved = 0;
   const missing = [];
 
   function resolveFinalNode(item) {
@@ -862,15 +923,47 @@ function applyFinalJsonToClone(finalJson, convertedFrame) {
     return null;
   }
 
+  function semanticLabel(item) {
+    return String(item && (item.name || item.role || item.type) ? (item.name || item.role || item.type) : "");
+  }
+
+  function isGroupSemanticName(value) {
+    return /_group$/.test(String(value || ""));
+  }
+
+  function promoteAncestorGroup(node, name) {
+    if (!node || !name) return null;
+    let current = node;
+    while (current && current.parent && current.parent.id !== convertedFrame.id) {
+      current = current.parent;
+    }
+    const top = current && current.parent && current.parent.id === convertedFrame.id ? current : null;
+    if (!top || top.id === convertedFrame.id) return null;
+    setSemanticName(top, name);
+    return top;
+  }
+
   function applyTree(item) {
     if (!item || typeof item !== "object") return null;
     const children = Array.isArray(item.children) ? item.children : [];
     const exactNode = resolveFinalNode(item);
+    const label = semanticLabel(item);
 
     if (exactNode && exactNode.id !== convertedFrame.id) {
-      if (setSemanticName(exactNode, item.name || item.role || item.type)) renamed++;
+      if (setSemanticName(exactNode, label)) renamed++;
       for (const child of children) applyTree(child);
       return exactNode;
+    }
+
+    const path = String(item.path || "").trim();
+    if (!exactNode && path) {
+      const wrapper = path.indexOf("/") > -1
+        ? pathNodeMap.get(path.split("/").slice(0, -1).join("/"))
+        : getTopLevelNodeByPath(convertedFrame, path);
+      if (wrapper && wrapper.id !== convertedFrame.id && (isGenericLayerName(wrapper.name) || isGroupSemanticName(label))) {
+        setSemanticName(wrapper, label || "semantic_group");
+        groupsRenamed++;
+      }
     }
 
     const matchedChildren = [];
@@ -884,11 +977,37 @@ function applyFinalJsonToClone(finalJson, convertedFrame) {
       return null;
     }
 
+    if (isGroupSemanticName(label)) {
+      const promoted = promoteAncestorGroup(matchedChildren[0], label);
+      if (promoted) {
+        groupsRenamed++;
+        return promoted;
+      }
+    }
+
+    const topLevelMap = new Map();
+    for (const node of matchedChildren) {
+      const top = getAncestorUnderRoot(convertedFrame, node);
+      if (top && top.id !== convertedFrame.id) {
+        topLevelMap.set(top.id, top);
+      }
+    }
+    if (topLevelMap.size === 1) {
+      const topWrapper = Array.from(topLevelMap.values())[0];
+      if (topWrapper && (isGenericLayerName(topWrapper.name) || isGroupSemanticName(label))) {
+        setSemanticName(topWrapper, label || "semantic_group");
+        groupsRenamed++;
+        wrappersRemoved += unwrapAnonymousWrappers(topWrapper);
+        return topWrapper;
+      }
+    }
+
     if (canSafelyGroup(matchedChildren)) {
       try {
         const groupNode = figma.group(matchedChildren, matchedChildren[0].parent);
-        if (setSemanticName(groupNode, item.name || item.role || "semantic_group")) {
+        if (setSemanticName(groupNode, label || "semantic_group")) {
           groupsCreated++;
+          wrappersRemoved += unwrapAnonymousWrappers(groupNode);
           return groupNode;
         }
       } catch (e) {
@@ -902,8 +1021,9 @@ function applyFinalJsonToClone(finalJson, convertedFrame) {
     }
     if (parentMap.size === 1) {
       const parent = Array.from(parentMap.values())[0];
-      if (parent && parent.id !== convertedFrame.id && setSemanticName(parent, item.name || item.role || "semantic_group")) {
+      if (parent && parent.id !== convertedFrame.id && setSemanticName(parent, label || "semantic_group")) {
         groupsRenamed++;
+        wrappersRemoved += unwrapAnonymousWrappers(parent);
         return parent;
       }
     }
@@ -914,6 +1034,7 @@ function applyFinalJsonToClone(finalJson, convertedFrame) {
   for (const child of Array.isArray(finalJson && finalJson.children) ? finalJson.children : []) {
     applyTree(child);
   }
+  wrappersRemoved += unwrapAnonymousWrappers(convertedFrame);
 
   convertedFrame.name = preservedRootName;
   return {
@@ -921,6 +1042,7 @@ function applyFinalJsonToClone(finalJson, convertedFrame) {
     renamed,
     groupsCreated,
     groupsRenamed,
+    wrappersRemoved,
     missing,
     remainingGeneric: collectGenericNodes(convertedFrame),
   };
@@ -968,78 +1090,83 @@ function postError(message) {
 figma.ui.onmessage = async (msg) => {
   if (msg.type === "classify-zone-selected-frame") {
     const selection = figma.currentPage.selection;
-    if (selection.length !== 1 || selection[0].type !== "FRAME") {
-      postError("Select exactly one frame.");
+    const selectedFrames = selection.filter((node) => node && node.type === "FRAME");
+    if (selectedFrames.length === 0 || selectedFrames.length !== selection.length) {
+      postError("Select one or more frames only.");
       sendSelectionInfo();
       return;
     }
-    const selectedFrame = selection[0];
     const backendUrl = String(msg.backendUrl || "").trim().replace(/\/+$/, "");
     if (!backendUrl) {
       postError("Backend URL is empty.");
       return;
     }
     const requestUrl = backendUrl + "/api/v2/analyze-text-zone-visual-json";
+    const selectedFrame = selectedFrames[0];
     try {
-      const stampedNodeCount = stampOriginalNodeIds(selectedFrame);
-      const origin = getOrigin(selectedFrame);
-      const rawJson = serializeNode(selectedFrame, origin, "");
-      rawJson.templateId = "figma_plugin";
-      postStatus("Exporting banner.png…");
-      const pngBytes = await exportFramePngBytes(selectedFrame);
-      const pngBase64 = uint8ToBase64(pngBytes);
-      postStatus("Calling visual zone + text-zone analysis with raw JSON…");
-      console.log("POST analyze-text-zone-visual:", requestUrl);
-      const requestBody = { banner_png_base64: pngBase64, raw_json: rawJson };
-      const response = await fetch(requestUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(requestBody),
-      });
-      const text = await response.text();
-      let data = null;
-      try {
-        data = text ? JSON.parse(text) : null;
-      } catch (parseErr) {
-        data = null;
+      const box = selectionBounds(selectedFrames);
+      const convertedFrames = [];
+      const results = [];
+      for (let i = 0; i < selectedFrames.length; i++) {
+        const frame = selectedFrames[i];
+        postStatus(`Processing frame ${i + 1}/${selectedFrames.length}: ${frame.name}`);
+        const stampedNodeCount = stampOriginalNodeIds(frame);
+        const origin = getOrigin(frame);
+        const rawJson = serializeNode(frame, origin, "");
+        rawJson.templateId = "figma_plugin";
+        const pngBytes = await exportFramePngBytes(frame);
+        const pngBase64 = uint8ToBase64(pngBytes);
+        console.log("POST analyze-text-zone-visual:", requestUrl, "frame:", frame.name);
+        const requestBody = { banner_png_base64: pngBase64, raw_json: rawJson };
+        const response = await fetch(requestUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(requestBody),
+        });
+        const text = await response.text();
+        let data = null;
+        try {
+          data = text ? JSON.parse(text) : null;
+        } catch (parseErr) {
+          data = null;
+        }
+        if (!response.ok) {
+          const detail =
+            data && typeof data === "object" && data.detail != null
+              ? typeof data.detail === "string"
+                ? data.detail
+                : JSON.stringify(data.detail)
+              : text || "HTTP " + String(response.status);
+          throw new Error(`Frame ${i + 1}/${selectedFrames.length} (${frame.name}): ${detail}`);
+        }
+        if (!data || typeof data !== "object") {
+          throw new Error(`Invalid JSON from backend for frame ${frame.name}.`);
+        }
+        let finalSummary = null;
+        let convertedFrame = null;
+        if (data.final_json && typeof data.final_json === "object") {
+          convertedFrame = cloneFrameToSemanticOutputArea(frame, box, i);
+          finalSummary = applyFinalJsonToClone(data.final_json, convertedFrame);
+          convertedFrames.push(convertedFrame);
+          console.log("Final JSON clone summary:", frame.name, finalSummary, "stamped:", stampedNodeCount);
+        }
+        results.push({ frame: frame.name, result: data, summary: finalSummary });
       }
-      if (!response.ok) {
-        const detail =
-          data && typeof data === "object" && data.detail != null
-            ? typeof data.detail === "string"
-              ? data.detail
-              : JSON.stringify(data.detail)
-            : text || "HTTP " + String(response.status);
-        throw new Error(detail);
-      }
-      if (!data || typeof data !== "object") {
-        throw new Error("Invalid JSON from backend.");
-      }
-      let finalSummary = null;
-      if (data.final_json && typeof data.final_json === "object") {
-        postStatus("Creating semantic clone from final JSON…");
-        const convertedFrame = cloneFrameBeside(selectedFrame);
-        finalSummary = applyFinalJsonToClone(data.final_json, convertedFrame);
-        figma.currentPage.selection = [convertedFrame];
-        figma.viewport.scrollAndZoomIntoView([selectedFrame, convertedFrame]);
-        console.log("Final JSON clone summary:", finalSummary);
-      }
-      postStatus("Zone + text-zone analysis complete.");
+      postStatus(`Zone + text-zone analysis complete for ${selectedFrames.length} frame(s).`);
       figma.ui.postMessage({
         type: "zone-classify-result",
         ok: true,
-        result: data,
+        result: results.length === 1 ? results[0].result : { batch: results },
       });
+      if (convertedFrames.length > 0) {
+        figma.currentPage.selection = convertedFrames;
+        figma.viewport.scrollAndZoomIntoView([...selectedFrames, ...convertedFrames]);
+      }
       figma.notify(
-        "Zone: " +
-          data.zone_type +
-          " (" +
-          Number(data.confidence).toFixed(2) +
-          ")" +
-          (finalSummary ? `; semantic clone renamed ${finalSummary.renamed} nodes` : ""),
-        { timeout: 5 },
+        `Processed ${selectedFrames.length} frame(s); created ${convertedFrames.length} semantic clone(s).`,
+        { timeout: 6 },
       );
       figma.ui.postMessage({ type: "done" });
       sendSelectionInfo();
